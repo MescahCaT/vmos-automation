@@ -1,0 +1,28 @@
+{
+  "proxies": [
+    {
+      "id": "proxy-example",
+      "protocol": "socks5",
+      "host": "proxy.example.com",
+      "port": 1080,
+      "username": "REPLACE_ME",
+      "password": "REPLACE_ME",
+      "enabled": true,
+      "engine_type": 0,
+      "region": {
+        "country": "US",
+        "language": "en",
+        "timezone": "America/New_York"
+      },
+      "transit": {
+        "protocol": "vless",
+        "host": "relay.example.com",
+        "port": 443,
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "network": "tcp",
+        "tls": true,
+        "enabled": true
+      }
+    }
+  ]
+}

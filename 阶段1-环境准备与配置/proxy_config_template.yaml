@@ -1,0 +1,11 @@
+# 旧YAML模板供参考。实际运行读取 配置文件/proxy_list.json。
+# 单台验证准备一条即可，扩容时按实际云机数量补齐独立代理。
+proxies:
+  - id: "proxy-001"
+    protocol: "socks5"
+    host: "proxy.example.com"
+    port: 1080
+    username: "replace_me"
+    password: "replace_me"
+    enabled: true
+# 不把代理密码或完整认证URL复制到检查报告和设备映射。

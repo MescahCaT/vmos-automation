@@ -1,0 +1,20 @@
+{
+  "host_ip": "192.168.110.35",
+  "count": 1,
+  "devices": [
+    {
+      "user_name": "tk-REPLACE-WITH-UNIQUE-NAME",
+      "remark": "单台使用模板，请先修改为唯一名称",
+      "config": {
+        "image_repository": "vcloud_android15_edge_20260731174356",
+        "adiID": 1039,
+        "resolution": {"dpi": 420, "fps": 60, "height": 1920, "width": 1080},
+        "selinux": false,
+        "dns": ["223.5.5.5", "223.6.6.6"],
+        "bool_gms_disabled": false,
+        "bool_gms_upgrade_enable": false
+      }
+    }
+  ],
+  "port_config": {"auto_allocate": false}
+}

@@ -1,0 +1,72 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Credentials and machine-specific configuration (keep safe examples)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+/配置文件/*.json
+/配置文件/*.yaml
+/配置文件/*.yml
+!/配置文件/*.example.json
+!/配置文件/*.example.yaml
+!/配置文件/*.example.yml
+
+# Local data, logs, backups and temporary files
+/数据/
+/日志/
+*.log
+*_log.txt
+*.bak
+*.tmp
+*.temp
+*.old
+*~
+/analysis.txt
+
+# Generated device, proxy, system and installation results
+/阶段2-云机批量创建与初始化/*.json
+/阶段3-网络代理配置/*.json
+/阶段4-系统设置与环境配置/*.json
+/阶段5-TikTok应用安装/*.json
+/阶段6-TikTok自动登录/*.json
+/阶段6-TikTok自动登录/account_attempts/
+/阶段6-TikTok自动登录/network_compare_test/
+/阶段6-TikTok自动登录/screenshots/
+/阶段12-文档与交付/closure_*/
+
+# Batch examples are also used as local command output
+/阶段9-脚本开发与集成/batch*_create.example.json
+/阶段9-脚本开发与集成/batch*_bindings.example.json
+
+# Downloaded applications and third-party binaries
+*.apk
+*.apks
+*.xapk
+*.aab
+*.exe
+*.dll
+/tools/mihomo/
+
+# Local editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

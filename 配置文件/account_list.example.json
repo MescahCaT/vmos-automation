@@ -1,0 +1,11 @@
+{
+  "accounts": [
+    {
+      "email": "account@example.com",
+      "username": "account_example",
+      "login_mode": "email_code",
+      "enabled": true,
+      "note": "替换为自己的账号；密码通过环境变量提供。"
+    }
+  ]
+}

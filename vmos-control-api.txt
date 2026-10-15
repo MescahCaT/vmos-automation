@@ -1,0 +1,2707 @@
+VMOS Edge Control API - AI快速参考
+版本: 2026-09-11
+语言: zh-CN
+
+========================
+1. 基础信息
+========================
+
+版本要求:
+- Android 10: vcloud_android10_edge_20260110及以上
+- Android 13: vcloud_android13_edge_20260110及以上
+- Android 15: vcloud_android15_edge_20260110及以上
+- CBS: 1.1.1.10及以上
+
+调用方式:
+
+方式1 - 云机外HTTP调用(推荐):
+- URL格式: http://{主机IP}:18182/android_api/v2/{云机ID}/{接口路径}
+- 示例: http://192.168.1.100:18182/android_api/v2/EDGE12345678/activity/start
+
+方式2 - 云机内HTTP调用:
+- URL格式: http://127.0.0.1:18185/api/{接口路径}
+- 示例: http://127.0.0.1:18185/api/activity/start
+
+安全:
+- 仅用于可信局域网,不要将18182/18185端口直接暴露到公网
+- 先调用/base/version_info检查version_code和supported_list
+- 同时检查HTTP状态和业务code,code=200才表示成功
+
+方式3 - MCP调用(AI Agent集成, 需API版本1.0.7及以上):
+- 局域网模式(创建云机时勾选了"启用局域网IP"): http://{云机IP}:18185/mcp/sse
+- 非局域网模式(创建云机时未勾选"启用局域网IP"): http://{主机IP}:18182/android_api/v2/{云机ID}/mcp/sse
+- 兼容客户端: Claude Code、Cursor、Codex、Gemini、通义千问、Kimi等
+- Claude Code: claude mcp add --transport sse vmos-edge-control-api http://{云机IP}:18185/mcp/sse
+- Cursor(.cursor/mcp.json): {"mcpServers": {"vmos-edge-control-api": {"url": "http://{云机IP}:18185/mcp/sse"}}}
+- 通义千问/Kimi(MCP服务配置): {"mcpServers": {"vmos-edge-control-api": {"type": "sse", "url": "http://{云机IP}:18185/mcp/sse"}}}
+- Gemini(~/.gemini/settings.json): {"mcpServers": {"vmos-edge-control-api": {"httpUrl": "http://{云机IP}:18185/mcp/sse"}}}
+
+方式4 - CLI命令行工具(ve):
+- Android设备上已预装在 /data/local/tmp/ve
+- 其他平台(macOS/Windows/Linux)需从构建产物获取
+- TCP端口: 18186
+- 本机调用示例: ve -s 127.0.0.1 -l
+- 使用 -s 连接设备进入交互模式: ve -s {云机IP}
+- 单条命令: ve -s {云机IP} -l (列出接口)
+- 参数: -l(列出接口) -s(连接设备) -j(JSON body) -f(文件) -v(版本) -h(帮助)
+- 根据系统语言自动切换中英文
+
+通用响应结构:
+{
+  "code": 200,          // 状态码,200为成功
+  "data": {...},        // 业务数据
+  "msg": "OK",          // 状态描述
+  "request_id": "..."   // 请求唯一标识
+}
+
+常见错误码:
+- 200: 成功
+- 400: 参数错误
+- 404: 接口不存在
+- 500: 服务器内部错误
+
+========================
+2. 基础能力 (Base)
+========================
+
+## 获取API版本
+GET /base/version_info
+
+说明: 需要镜像版本20260113及以上
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "version_name": "1.0.0",
+    "version_code": 100,
+    "supported_list": [
+      "base/sleep",
+      "workflow",
+      "base/version_info",
+      "activity/start"
+    ]
+  },
+  "msg": "OK",
+  "request_id": "si123456"
+}
+
+## 暂停响应
+POST /base/sleep
+
+说明: 常用于脚本执行中的等待,需要镜像版本20260113及以上
+
+参数:
+- duration (必填): 暂停时长(ms)
+
+请求示例:
+{
+  "duration": 2000
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "sl123456"
+}
+
+## 查询或设置轨迹调试开关
+POST /base/api_global_settings
+
+查询body: {}
+设置body: {"debug":true}
+返回data: {"debug":true}
+
+========================
+3. 工作流 (Workflow)
+========================
+
+## 执行工作流
+POST /workflow
+
+说明: 在单个请求中按顺序执行多个接口动作,需要镜像版本20260113及以上
+
+参数:
+- actions (必填): 动作列表,每个对象包含path和params
+
+请求示例:
+{
+  "actions": [
+    {
+      "path": "activity/start",
+      "params": {"package_name": "com.android.settings"}
+    },
+    {
+      "path": "base/sleep",
+      "params": {"duration": 2000}
+    },
+    {
+      "path": "input/click",
+      "params": {"x": 500, "y": 800}
+    }
+  ]
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": [
+    {
+      "request_id": "8aca36b28c444ca09d07fb2690d03a3d",
+      "response_data": {
+        "package_name": "com.android.settings",
+        "class_name": "com.android.settings.Settings"
+      }
+    },
+    {
+      "request_id": "9bca36b28c444ca09d07fb2690d03a3e",
+      "response_data": true
+    },
+    {
+      "request_id": "0cca36b28c444ca09d07fb2690d03a3f",
+      "response_data": {"x": 500, "y": 800}
+    }
+  ],
+  "msg": "OK",
+  "request_id": "wf123456"
+}
+
+========================
+4. 应用运行管理 (Activity)
+========================
+
+## 启动应用
+POST /activity/start
+
+参数:
+- package_name (必填): 应用包名
+
+请求示例:
+{
+  "package_name": "com.android.settings"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "package_name": "com.android.settings",
+    "class_name": "com.android.settings.Settings"
+  },
+  "msg": "OK",
+  "request_id": "8aca36b28c444ca09d07fb2690d03a3d"
+}
+
+## 启动指定Activity
+POST /activity/start_activity
+
+参数:
+- package_name (可选): 应用包名(指定action时可选)
+- class_name (可选): Activity类名
+- action (可选): Intent action
+- data (可选): Intent data (URI)
+- extras (可选): Intent extras (Key-Value键值对)
+
+请求示例:
+{
+  "package_name": "com.android.settings",
+  "class_name": "com.android.settings.Settings",
+  "extras": {
+    "extra_key": "extra_value",
+    "is_test": true
+  }
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "sa123456"
+}
+
+## 停止应用
+POST /activity/stop
+
+参数:
+- package_name (必填): 应用包名
+
+请求示例:
+{
+  "package_name": "com.android.settings"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "a1b2c3d4e5f6g7h8i9j0"
+}
+
+## 停止所有应用
+POST /activity/stop_all_apps
+
+说明: 停止所有运行中的应用（排除系统应用）
+
+参数:
+- exclude_packages (可选): 额外排除不停止的包名列表 (字符串数组)
+- back_home (可选): 停止后是否回到桌面，默认 true
+
+请求示例:
+{
+  "exclude_packages": ["com.example.app1"]
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": ["com.example.app1", "com.example.app2"],
+  "msg": "OK",
+  "request_id": "b2c3d4e5f6g7h8i9j0a1"
+}
+
+## 获取正在运行的进程
+GET /activity/processes
+
+返回示例:
+{
+  "code": 200,
+  "data": [
+    {
+      "process_name": "com.android.settings",
+      "pid": 1234,
+      "uid": 1000,
+      "package_names": ["com.android.settings"],
+      "importance": 100
+    }
+  ],
+  "msg": "OK",
+  "request_id": "c3d4e5f6g7h8i9j0a1b2"
+}
+
+## 获取最上层组件信息
+GET /activity/top_activity
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "package_name": "com.android.settings",
+    "class_name": "com.android.settings.Settings"
+  },
+  "msg": "OK",
+  "request_id": "ta123456"
+}
+
+## 获取最近任务列表
+GET /activity/recent_tasks?max_num=20
+
+参数:
+- max_num (可选): 最大数量,默认20
+
+返回示例:
+{
+  "code": 200,
+  "data": [
+    {
+      "task_id": 123,
+      "base_package_name": "com.android.settings",
+      "base_class_name": "com.android.settings.Settings",
+      "top_package_name": "com.android.settings",
+      "top_class_name": "com.android.settings.Settings",
+      "num_activities": 1,
+      "last_active_time": 1736412345000
+    }
+  ],
+  "msg": "OK",
+  "request_id": "rt123456"
+}
+
+## 清空任务栈
+POST /activity/clear_tasks
+
+说明: 移除所有最近任务(类似于清理后台)
+
+返回示例:
+{
+  "code": 200,
+  "data": [
+    {
+      "task_id": 123,
+      "base_package_name": "com.android.settings",
+      "base_class_name": "com.android.settings.Settings",
+      "top_package_name": "com.android.settings",
+      "top_class_name": "com.android.settings.Settings"
+    }
+  ],
+  "msg": "OK",
+  "request_id": "ct123456"
+}
+
+## 切换任务到前台
+POST /activity/move_to_front
+
+参数:
+- task_id (必填): 任务ID
+
+请求示例:
+{
+  "task_id": 123
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "mtf123456"
+}
+
+========================
+5. 应用管理 (Package)
+========================
+
+## 安装应用
+POST /package/install_sync
+
+说明: 支持APK、APKS、APKM、XAPK等格式
+
+Content-Type: multipart/form-data
+
+参数:
+- file (必填): APK/XAPK文件 (Multipart方式)
+- installer_package_name (可选): 指定安装来源包名
+
+返回示例:
+{
+  "code": 200,
+  "cost": 2723,
+  "data": {
+    "android.content.pm.extra.STATUS": 0,
+    "android.content.pm.extra.PACKAGE_NAME": "com.apkmirror.helper.prod",
+    "android.content.pm.extra.PRE_APPROVAL": false,
+    "android.content.pm.extra.SESSION_ID": 1513445030,
+    "android.content.pm.extra.LEGACY_STATUS": 1,
+    "android.content.pm.extra.STATUS_MESSAGE": "INSTALL_SUCCEEDED: Session installed"
+  },
+  "msg": "OK",
+  "request_id": "84d5716b8d374006b4cba9caaef794b6"
+}
+
+## 通过 URI 安装应用
+POST /package/install_uri_sync
+
+说明: 仅支持URI方式安装，不支持文件上传。同步等待安装完成后返回结果。支持APK、APKS、APKM、XAPK等格式。
+
+参数:
+- uri (必填): APK URI，支持 http://、https://（自动下载）、file://、content:// 或本地路径
+- installer_package_name (可选): 指定安装来源包名
+
+请求示例:
+{
+  "uri": "https://example.com/app.apk"
+}
+
+返回示例:
+{
+  "code": 200,
+  "cost": 2723,
+  "data": {
+    "android.content.pm.extra.STATUS": 0,
+    "android.content.pm.extra.PACKAGE_NAME": "com.example.app",
+    "android.content.pm.extra.PRE_APPROVAL": false,
+    "android.content.pm.extra.SESSION_ID": 1513445030,
+    "android.content.pm.extra.LEGACY_STATUS": 1,
+    "android.content.pm.extra.STATUS_MESSAGE": "INSTALL_SUCCEEDED: Session installed"
+  },
+  "msg": "OK",
+  "request_id": "84d5716b8d374006b4cba9caaef794b6"
+}
+
+## 卸载应用
+POST /package/uninstall
+
+参数:
+- package_name (必填): 应用包名
+
+请求示例:
+{
+  "package_name": "com.example.app"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "n4o5p6q7r8s9t0u1v2w3"
+}
+
+## 设置应用启用状态
+POST /package/enabled
+
+参数:
+- package_name (必填): 应用包名
+- enabled (必填): 是否启用
+
+请求示例:
+{
+  "package_name": "com.example.app",
+  "enabled": false
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "se123456"
+}
+
+## 获取已安装应用列表
+GET /package/list?type=user
+
+参数:
+- type (可选): all=全部, system=系统应用, user=用户应用(默认user)
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "type": "user",
+    "count": 1,
+    "packages": [
+      {
+        "package_name": "com.example.app",
+        "app_name": "示例应用",
+        "version_name": "1.0.0",
+        "version_code": 1,
+        "is_system": false,
+        "enabled": true,
+        "uid": 10123,
+        "source_dir": "/data/app/...",
+        "data_dir": "/data/user/0/..."
+      }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "l2m3n4o5p6q7r8s9t0u1"
+}
+
+## 导出应用APK
+GET /package/export?package_name=com.example.app
+
+说明: 单APK返回原始APK,分包返回ZIP
+
+参数:
+- package_name (必填): 应用包名
+
+返回: APK或ZIP二进制流
+
+## 清除应用数据
+POST /package/clear_data
+
+参数:
+- package_name (必填): 应用包名
+
+请求示例:
+{
+  "package_name": "com.android.settings"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "b2c3d4e5f6g7h8i9j0a1"
+}
+
+========================
+6. 输入控制 (Input)
+========================
+
+## 点击
+POST /input/click
+
+参数:
+- x (必填): X坐标
+- y (必填): Y坐标
+
+请求示例:
+{
+  "x": 100,
+  "y": 200
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {"x": 100, "y": 200},
+  "msg": "OK",
+  "request_id": "d4e5f6g7h8i9j0a1b2c3"
+}
+
+## 多击
+POST /input/multi_click
+
+参数:
+- x (必填): X坐标
+- y (必填): Y坐标
+- times (可选): 点击次数,默认2
+- interval (可选): 点击间隔(ms),默认100
+
+请求示例:
+{
+  "x": 100,
+  "y": 200,
+  "times": 3,
+  "interval": 200
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "x": 100,
+    "y": 200,
+    "times": 3,
+    "interval": 200
+  },
+  "msg": "OK",
+  "request_id": "mc12345678"
+}
+
+## 输入文本
+POST /input/text
+
+参数:
+- text (必填): 要输入的文本内容
+
+请求示例:
+{
+  "text": "Hello World"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "text": "Hello World",
+    "length": 11
+  },
+  "msg": "OK",
+  "request_id": "e5f6g7h8i9j0a1b2c3d4"
+}
+
+## 按键
+POST /input/keyevent
+
+参数:
+- key_code (可选): 单个按键KeyCode (如4=返回, 3=Home)
+- key_codes (可选): 组合按键列表 (如[113, 29]为CTRL+A)
+
+请求示例(单按键):
+{
+  "key_code": 4
+}
+
+请求示例(组合键):
+{
+  "key_codes": [113, 29]
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": [4],
+  "msg": "OK",
+  "request_id": "f6g7h8i9j0a1b2c3d4e5"
+}
+
+常用按键码:
+- 3: HOME键
+- 4: BACK返回键
+- 24: 音量+
+- 25: 音量-
+- 26: 电源键
+- 82: 菜单键
+- 111: ESC键
+- 122: MOVE_HOME键
+- 123: MOVE_END键
+
+## 滑动
+POST /input/swipe
+
+参数:
+- start_x (必填): 起点X
+- start_y (必填): 起点Y
+- end_x (必填): 终点X
+- end_y (必填): 终点Y
+- duration (可选): 持续时间(ms),默认300
+- up_delay (可选): 松手延迟(ms), null=立即松手, -1=不松手
+
+请求示例:
+{
+  "start_x": 100,
+  "start_y": 800,
+  "end_x": 100,
+  "end_y": 200,
+  "duration": 500
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "start_x": 100,
+    "start_y": 800,
+    "end_x": 100,
+    "end_y": 200,
+    "duration": 500,
+    "up_delay": null
+  },
+  "msg": "OK",
+  "request_id": "g7h8i9j0a1b2c3d4e5f6"
+}
+
+## 曲线滑动
+POST /input/scroll_bezier
+
+参数:
+- start_x (必填): 起点X
+- start_y (必填): 起点Y
+- end_x (必填): 终点X
+- end_y (必填): 终点Y
+- duration (可选): 持续时间(ms),默认500
+- up_delay (可选): 松手延迟(ms)
+- clear_fling (可选): 惯性消除策略("repeat_last"=重复最后一个点)
+
+请求示例:
+{
+  "start_x": 200,
+  "start_y": 1600,
+  "end_x": 200,
+  "end_y": 200,
+  "duration": 500
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "start_x": 200,
+    "start_y": 1600,
+    "end_x": 200,
+    "end_y": 200,
+    "duration": 500
+  },
+  "msg": "OK",
+  "request_id": "8aca36b28c444ca09d07fb2690d03a3d"
+}
+
+## 发送原始MotionEvent事件
+POST /input/motion_event
+
+参数:
+- events (必填): MotionEvent事件列表
+
+Event对象说明:
+- action (必填): 动作类型(0=DOWN, 1=UP, 2=MOVE, 3=CANCEL)
+- x (必填): X坐标
+- y (必填): Y坐标
+- delay (可选): 发送前延迟(ms)
+- pressure (可选): 压力值,默认1.0
+- down_time (可选): 按下时间戳
+
+请求示例:
+{
+  "events": [
+    {"action": 0, "x": 100, "y": 200, "delay": 0},
+    {"action": 2, "x": 150, "y": 250, "delay": 50},
+    {"action": 1, "x": 200, "y": 300, "delay": 50}
+  ]
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "sent_count": 3,
+    "events": [...]
+  },
+  "msg": "OK",
+  "request_id": "mot1234567890"
+}
+
+========================
+7. 权限管理 (Permission)
+========================
+
+## 获取应用权限
+GET /permission/get?package_name=com.example.app
+
+参数:
+- package_name (必填): 应用包名
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "package_name": "com.example.app",
+    "count": 2,
+    "permissions": [
+      {"permission": "android.permission.CAMERA", "granted": true},
+      {"permission": "android.permission.RECORD_AUDIO", "granted": false}
+    ]
+  },
+  "msg": "OK",
+  "request_id": "per1234567890"
+}
+
+## 设置应用权限
+POST /permission/set
+
+参数:
+- package_name (必填): 应用包名
+- grant (必填): true=授予, false=撤销
+- permissions (可选): 权限列表
+- grant_all (可选): 是否授予所有请求的权限
+- special_permission (可选): 是否授予特殊系统权限
+
+特殊权限说明:
+- 悬浮窗: 允许应用在其他应用上层显示
+- 文件管理: 允许应用访问所有外部存储文件(Android 11+)
+- 录屏: 自动允许录屏请求,跳过系统安全确认
+
+请求示例:
+{
+  "package_name": "com.example.app",
+  "grant": true,
+  "permissions": ["android.permission.CAMERA"],
+  "special_permission": true
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "package_name": "com.example.app",
+    "grant": true,
+    "success_count": 1
+  },
+  "msg": "OK",
+  "request_id": "per0987654321"
+}
+
+========================
+8. 文件管理 (File)
+========================
+
+## 导入文件
+POST /file/import
+Content-Type: multipart/form-data
+
+参数:
+- dir_path (必填): 目标目录(如/sdcard/Download/)
+- file (必填): 文件字段,支持多个文件
+- scan (可选): 是否扫描媒体库,默认true
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "files": [
+      {
+        "file_path": "/sdcard/Download/image.jpg",
+        "file_size": 123456,
+        "scanned": true,
+        "mime_type": "image/jpeg"
+      }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "t0u1v2w3x4y5z6a7b8c9"
+}
+
+## 扫描媒体文件
+POST /file/media_scan
+
+说明: 需要API版本1.0.4及以上,只扫描图片、视频和音频
+
+参数:
+- paths (必填): 文件路径列表
+- mime_types (必填): MIME类型列表(与paths一一对应)
+
+请求示例:
+{
+  "paths": [
+    "/sdcard/Download/image.jpg",
+    "/sdcard/Download/video.mp4"
+  ],
+  "mime_types": [
+    "image/jpeg",
+    "video/mp4"
+  ]
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "sm123456"
+}
+
+## 导出文件
+GET /file/export?path=/sdcard/Download/test.txt
+
+参数:
+- path (必填): 文件路径
+
+返回: 文件二进制流
+
+## 列出目录内容
+GET /file/list?path=/sdcard&show_hidden=false
+
+参数:
+- path (必填): 目录路径
+- show_hidden (可选): 是否显示隐藏文件,默认false
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "path": "/sdcard",
+    "count": 2,
+    "files": [
+      {
+        "name": "Download",
+        "absolute_path": "/sdcard/Download",
+        "is_directory": true,
+        "is_file": false,
+        "size": 4096,
+        "last_modified": 1736412345000,
+        "can_read": true,
+        "can_write": true,
+        "can_execute": true
+      }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "u1v2w3x4y5z6a7b8c9d0"
+}
+
+========================
+9. 系统设置 (System)
+========================
+
+## 执行Shell命令
+POST /system/shell
+
+参数:
+- command (必填): 要执行的Shell命令
+- is_root (可选): 是否以root用户执行,默认true
+
+请求示例:
+{
+  "command": "ls -l /sdcard",
+  "is_root": true
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "command": "ls -l /sdcard",
+    "is_root": true,
+    "exit_code": 0,
+    "output": "total 0\ndrwxrwx--- 2 root ...",
+    "error": ""
+  },
+  "msg": "OK",
+  "request_id": "q7r8s9t0u1v2w3x4y5z6"
+}
+
+## 设置壁纸
+POST /system/wallpaper
+
+参数:
+- path (必填): 图片路径(实例内路径或Assets路径)
+- type (可选): file(默认)或asset
+
+请求示例:
+{
+  "path": "/sdcard/Download/wallpaper.jpg",
+  "type": "file"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "wal1234567890"
+}
+
+## 更新系统设置
+POST /system/update_settings
+
+说明: 需要镜像版本20260113及以上
+
+参数:
+- timezone (可选): 时区ID(如Asia/Shanghai)
+- language (可选): 语言代码(如zh)
+- region (可选): 国家/地区代码(如CN)
+
+请求示例:
+{
+  "timezone": "Asia/Shanghai",
+  "language": "zh",
+  "region": "CN"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "timezone": "Asia/Shanghai",
+    "language": "zh",
+    "region": "CN"
+  },
+  "msg": "OK",
+  "request_id": "us123456"
+}
+
+## 设置系统属性
+POST /system/set_prop
+
+说明: 需要镜像版本20260113及以上
+
+参数:
+- properties (可选): 属性键值对(直接使用指定的key)
+- persist_properties (可选): 属性键值对(key会自动加上系统前缀)
+
+请求示例:
+{
+  "properties": {
+    "persist.sys.test": "value1",
+    "debug.test": "value2"
+  },
+  "persist_properties": {
+    "test": "value1",
+    "key2": "value2"
+  }
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "persist.sys.test": true,
+    "debug.test": true,
+    "test": true,
+    "key2": true
+  },
+  "msg": "OK",
+  "request_id": "sp123456"
+}
+
+========================
+10. 电源管理 (Power)
+========================
+
+## 点亮/熄灭屏幕
+POST /power/set_screen
+
+参数:
+- on (必填): true=点亮屏幕, false=熄灭屏幕
+
+请求示例:
+{
+  "on": true
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {"on": true},
+  "msg": "OK",
+  "request_id": "ps123456"
+}
+
+## 锁定/解锁屏幕
+POST /power/locked
+
+参数:
+- locked (必填): true=锁定屏幕, false=解锁屏幕
+
+请求示例:
+{
+  "locked": true
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {"locked": true},
+  "msg": "OK",
+  "request_id": "pl123456"
+}
+
+## 获取屏幕与锁屏状态
+GET /power/status
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "is_screen_on": true,
+    "is_locked": false
+  },
+  "msg": "OK",
+  "request_id": "pst123456"
+}
+
+========================
+11. 电池管理 (Battery)
+========================
+
+## 获取电池信息
+GET /battery/get
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "technology": "Li-ion",
+    "icon-small": 17303583,
+    "max_charging_voltage": 4400000,
+    "health": 2,
+    "max_charging_current": 3250000,
+    "status": 3,
+    "plugged": 0,
+    "present": true,
+    "seq": 1941,
+    "charge_counter": 5000,
+    "level": 47,
+    "scale": 100,
+    "temperature": 338,
+    "voltage": 3036,
+    "invalid_charger": 0,
+    "battery_low": false
+  },
+  "msg": "OK",
+  "request_id": "bg123456"
+}
+
+字段说明:
+- level: 当前电量值(0-scale), -1=未知
+- scale: 最大电量值,通常为100
+- status: 电池状态(1=未知,2=充电中,3=放电中,4=未充电,5=已充满)
+- plugged: 充电器连接类型(0=未连接,1=AC充电,2=USB充电,4=无线充电)
+- health: 电池健康状态(1=未知,2=良好,3=过热,4=损坏,5=过压,6=未知故障,7=过冷)
+- voltage: 电池电压(mV), -1=未知
+- temperature: 电池温度(0.1°C,需除以10), -1=未知
+- technology: 电池技术类型(如Li-ion)
+
+## 设置电池信息
+POST /battery/set
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- level (可选): 电池电量(0-100)
+- status (可选): 电池状态
+- health (可选): 电池健康
+- plugged (可选): 充电方式
+
+请求示例:
+{
+  "level": 85,
+  "status": 2,
+  "health": 2,
+  "plugged": 2
+}
+
+返回示例: 返回设置后的最新电池信息(格式与GET相同)
+
+========================
+12. 本地化 (Locale)
+========================
+
+## 获取本地化信息
+GET /locale/list?display_languages=zh,en
+
+参数:
+- display_languages (可选): 显示名称的语言代码列表,默认["zh","en"]
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "languages": [
+      {"code": "zh", "names": {"zh": "中文", "en": "Chinese"}},
+      {"code": "en", "names": {"zh": "英语", "en": "English"}}
+    ],
+    "regions": [
+      {"code": "CN", "names": {"zh": "中国", "en": "China"}},
+      {"code": "US", "names": {"zh": "美国", "en": "United States"}}
+    ],
+    "time_zones": [
+      {
+        "id": "Asia/Shanghai",
+        "names": {"zh": "中国标准时间 (上海)", "en": "China Standard Time (Shanghai)"},
+        "offset": 28800000,
+        "raw_offset": 28800000
+      }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "li123456"
+}
+
+========================
+13. 剪贴板 (Clipboard)
+========================
+
+## 设置剪贴板
+POST /clipboard/set
+
+参数:
+- text (必填): 文本内容
+
+请求示例:
+{
+  "text": "Hello World"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "text": "Hello World",
+    "length": 11
+  },
+  "msg": "OK",
+  "request_id": "h8i9j0a1b2c3d4e5f6g7"
+}
+
+## 获取当前剪贴板
+GET /clipboard/get
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "text": "Hello World",
+    "length": 11
+  },
+  "msg": "OK",
+  "request_id": "i9j0a1b2c3d4e5f6g7h8"
+}
+
+## 获取剪贴板历史列表
+GET /clipboard/list
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "count": 2,
+    "mime_type": "text/plain",
+    "items": ["Hello", "World"]
+  },
+  "msg": "OK",
+  "request_id": "j0a1b2c3d4e5f6g7h8i9"
+}
+
+## 清空剪贴板
+POST /clipboard/clear
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "k1l2m3n4o5p6q7r8s9t0"
+}
+
+========================
+14. 屏幕与显示 (Display)
+========================
+
+## 获取屏幕信息
+GET /display/info
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "width": 1080,
+    "height": 1920,
+    "rotation": 0,
+    "orientation": 1
+  },
+  "msg": "OK",
+  "request_id": "o5p6q7r8s9t0u1v2w3x4"
+}
+
+## 屏幕旋转
+POST /display/rotate
+
+参数:
+- rotation (必填): 旋转角度(0=0°, 1=90°, 2=180°, 3=270°)
+
+请求示例:
+{
+  "rotation": 1
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "width": 1920,
+    "height": 1080,
+    "rotation": 1,
+    "orientation": 0
+  },
+  "msg": "OK",
+  "request_id": "p6q7r8s9t0u1v2w3x4y5"
+}
+
+## 屏幕截图(压缩)
+GET /screenshot/format?format=jpeg&quality=100
+
+参数:
+- format (可选): webp, png, jpeg(默认jpg)
+- quality (可选): 质量(1-100),默认100
+
+返回: 图片二进制流(Content-Type: image/jpeg等)
+
+## 获取截图
+GET /screenshot/raw
+
+返回: 原始RGBA像素数据流(ARGB_8888),每个像素占4字节
+
+========================
+15. 联系人管理 (Contact)
+========================
+
+## 添加联系人
+POST /contact/add
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- name (必填): 姓名
+- phone (必填): 电话号码
+- email (可选): 邮箱
+- organization (可选): 公司/组织
+- title (可选): 职位
+- note (可选): 备注
+
+请求示例:
+{
+  "name": "张三",
+  "phone": "13800138000"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": [
+    {
+      "_id": 1,
+      "display_name": "张三",
+      "has_phone_number": 1,
+      "phones": ["13800138000"]
+    }
+  ],
+  "msg": "OK",
+  "request_id": "con1234567890"
+}
+
+## 批量添加联系人
+POST /contact/add_list
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- contact_list (必填): 联系人列表
+
+请求示例:
+{
+  "contact_list": [
+    {"name": "张三", "phone": "13800138000"},
+    {"name": "李四", "phone": "13900139000", "email": "lisi@example.com"}
+  ]
+}
+
+返回示例: 返回添加后的联系人列表
+
+## 删除联系人
+POST /contact/delete
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- id (必填): 联系人ID
+
+请求示例:
+{
+  "id": 1
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "cd123456"
+}
+
+## 批量删除联系人
+POST /contact/delete_list
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- ids (必填): 联系人ID数组
+
+请求示例:
+{
+  "ids": [1, 2, 3]
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": 3,
+  "msg": "OK",
+  "request_id": "cdl123456"
+}
+
+## 获取联系人列表
+GET /contact/list?offset=0&limit=100
+
+参数:
+- offset (可选): 偏移量,默认0
+- limit (可选): 限制数量,默认100
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "offset": 0,
+    "limit": 100,
+    "count": 1,
+    "list": [
+      {
+        "_id": 1,
+        "display_name": "张三",
+        "has_phone_number": 1,
+        "phones": ["13800138000"]
+      }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "cl123456"
+}
+
+## 条件查询联系人
+POST /contact/query
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- id (可选): 联系人ID
+- name (可选): 联系人姓名(模糊匹配)
+- phone (可选): 电话号码
+- offset (可选): 偏移量,默认0
+- limit (可选): 限制数量,默认100
+
+请求示例:
+{
+  "name": "张"
+}
+
+返回示例: 返回符合条件的联系人列表
+
+## 清空联系人
+POST /contact/clear
+
+说明: 需要API版本1.0.4及以上
+
+返回示例:
+{
+  "code": 200,
+  "data": 5,
+  "msg": "OK",
+  "request_id": "cc123456"
+}
+
+========================
+16. 短信管理 (SMS)
+========================
+
+## 获取短信列表
+GET /sms/list?type=0&offset=0&limit=100
+
+参数:
+- type (可选): 短信类型(0=所有,1=收件箱,2=已发送,3=草稿,4=待发送,5=失败,6=队列),默认0
+- offset (可选): 偏移量,默认0
+- limit (可选): 限制数量,默认100
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "type": 0,
+    "offset": 0,
+    "limit": 100,
+    "count": 1,
+    "list": [
+      {
+        "_id": 1,
+        "address": "13800001234",
+        "body": "这是一条测试短信",
+        "date": 1736412345000,
+        "type": 1,
+        "type_name": "MESSAGE_TYPE_INBOX",
+        "read": 1,
+        "seen": 1,
+        "creator": "com.android.messaging",
+        "contact": {
+          "_id": 3,
+          "display_name": "张三"
+        }
+      }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "sl123456"
+}
+
+## 添加短信
+POST /sms/add
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- address (必填): 对方号码
+- body (必填): 短信内容
+- type (可选): 短信类型(1=收件箱,2=已发送,3=草稿,4=待发送,5=失败,6=队列),默认1
+- date (可选): 时间戳,默认当前时间
+- read (可选): 是否已读,默认true
+- seen (可选): 是否已展示,默认true
+
+请求示例:
+{
+  "address": "13800001234",
+  "body": "这是一条测试短信。",
+  "type": 1,
+  "read": true,
+  "seen": true
+}
+
+返回示例: 返回添加后的短信详情
+
+## 批量添加短信
+POST /sms/add_list
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- list (必填): 短信列表
+
+请求示例:
+{
+  "list": [
+    {"address": "13800001234", "body": "测试短信1", "type": 1},
+    {"address": "13900005678", "body": "测试短信2", "type": 1}
+  ]
+}
+
+返回示例: 返回添加后的短信列表
+
+## 接收短信(模拟发送短信)
+POST /sms/receive
+
+说明: 需要API版本1.0.4及以上,当前支持Android 13/14
+
+参数:
+- sender (必填): 发送者号码
+- body (必填): 短信内容
+
+请求示例:
+{
+  "sender": "13800001234",
+  "body": "您的验证码是 123456。"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "sr123456"
+}
+
+## 删除短信
+POST /sms/delete
+
+参数:
+- id (必填): 短信ID
+
+请求示例:
+{
+  "id": 1
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "sd123456"
+}
+
+## 批量删除短信
+POST /sms/delete_list
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- ids (必填): 短信ID数组
+
+请求示例:
+{
+  "ids": [1, 2, 3]
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": 3,
+  "msg": "OK",
+  "request_id": "sdl123456"
+}
+
+## 清空短信
+POST /sms/clear
+
+说明: 需要API版本1.0.4及以上
+
+返回示例:
+{
+  "code": 200,
+  "data": 20,
+  "msg": "OK",
+  "request_id": "sc123456"
+}
+
+========================
+17. 通话记录 (CallLog)
+========================
+
+## 添加通话记录
+POST /calllog/add
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- number (必填): 电话号码
+- type (可选): 类型(1=来电,2=去电,3=未接),默认1
+- date (可选): 时间戳,默认当前时间
+- duration (可选): 通话时长(秒),默认0
+
+请求示例:
+{
+  "number": "13800001234",
+  "type": 1,
+  "duration": 60
+}
+
+返回示例: 返回添加后的通话记录详情
+
+## 批量添加通话记录
+POST /calllog/add_list
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- list (必填): 通话记录列表
+
+请求示例:
+{
+  "list": [
+    {"number": "13800001234", "type": 1, "duration": 60},
+    {"number": "13900005678", "type": 2, "duration": 120}
+  ]
+}
+
+返回示例: 返回添加后的通话记录列表
+
+## 删除通话记录
+POST /calllog/delete
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- id (必填): 通话记录ID
+
+请求示例:
+{
+  "id": 1
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "cld123456"
+}
+
+## 批量删除通话记录
+POST /calllog/delete_list
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- ids (必填): 通话记录ID数组
+
+请求示例:
+{
+  "ids": [1, 2, 3]
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": 3,
+  "msg": "OK",
+  "request_id": "cldl123456"
+}
+
+## 清空通话记录
+POST /calllog/clear
+
+说明: 需要API版本1.0.4及以上
+
+返回示例:
+{
+  "code": 200,
+  "data": 15,
+  "msg": "OK",
+  "request_id": "clc123456"
+}
+
+## 获取通话记录列表
+GET /calllog/list?limit=100&offset=0
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- limit (可选): 限制数量,默认100
+- offset (可选): 偏移量,默认0
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "offset": 0,
+    "limit": 100,
+    "count": 1,
+    "list": [
+      {
+        "_id": 1,
+        "number": "13800001234",
+        "type": 1,
+        "type_name": "INCOMING_TYPE",
+        "date": 1678888888000,
+        "duration": 60,
+        "new": 0,
+        "cached_name": "张三",
+        "contact": {
+          "_id": 3,
+          "display_name": "张三"
+        }
+      }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "cll123456"
+}
+
+========================
+18. 位置管理 (Location)
+========================
+
+## 获取位置信息
+GET /location/get_data
+
+说明: 需要API版本1.0.4及以上
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "latitude": 39.9042,
+    "longitude": 116.4074,
+    "altitude": 0.0,
+    "speed": 0.0,
+    "bearing": 0.0,
+    "accuracy": 50.0,
+    "vertical_accuracy_meters": 50.0,
+    "speed_accuracy_meters_per_second": 1.0,
+    "bearing_accuracy_degrees": 30.0,
+    "enabled": true,
+    "time": 1673641234567,
+    "provider": "gps"
+  },
+  "msg": "OK",
+  "request_id": "lg123456"
+}
+
+## 设置位置信息
+POST /location/set_data
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- enabled (可选): 是否开启模拟定位
+- persist (可选): 是否持久化(重启后生效),默认false
+- latitude (可选): 纬度
+- longitude (可选): 经度
+- altitude (可选): 海拔(米),默认0.0
+- speed (可选): 速度(m/s),默认0.0
+- bearing (可选): 方向(角度),默认0.0
+- accuracy (可选): 水平精度(米),默认50.0
+- vertical_accuracy_meters (可选): 垂直精度(米),默认50.0
+- speed_accuracy_meters_per_second (可选): 速度精度(m/s),默认1.0
+- bearing_accuracy_degrees (可选): 方向精度(角度),默认30.0
+
+请求示例:
+{
+  "latitude": 39.9042,
+  "longitude": 116.4074,
+  "vertical_accuracy_meters": 50.0,
+  "enabled": true,
+  "persist": true
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "ls123456"
+}
+
+========================
+19. 传感器管理 (Sensor)
+========================
+
+## 获取传感器列表
+GET /sensor/list
+GET /sensor/list?type=1
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- type (可选): 传感器类型ID,不传返回所有
+
+返回示例:
+{
+  "code": 200,
+  "data": [
+    {
+      "name": "Goldfish 3-axis Accelerometer",
+      "type": 1,
+      "type_name": "TYPE_ACCELEROMETER",
+      "vendor": "The Android Open Source Project",
+      "version": 1,
+      "resolution": 0.0,
+      "power": 0.0,
+      "min_delay": 0,
+      "string_type": "android.sensor.accelerometer"
+    }
+  ],
+  "msg": "OK",
+  "request_id": "sl123456"
+}
+
+## 获取传感器数据
+GET /sensor/get_data
+GET /sensor/get_data?type=1&timeout=500
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- type (可选): 传感器类型ID,不传返回所有传感器数据
+- timeout (可选): 获取数据超时时间(ms),默认500
+
+返回示例(单个传感器):
+{
+  "code": 200,
+  "data": {
+    "type": 1,
+    "type_name": "TYPE_ACCELEROMETER",
+    "name": "Goldfish 3-axis Accelerometer",
+    "values": [0.0, 9.8, 0.0],
+    "timestamp": 1673641234567
+  },
+  "msg": "OK",
+  "request_id": "sg123456"
+}
+
+## 设置传感器数据
+POST /sensor/set_data
+
+说明: 需要API版本1.0.4及以上
+
+参数:
+- sensors (必填): 传感器数据列表
+
+Sensor对象说明:
+- type (必填): 传感器类型
+- value (可选): 单值传感器的值(如光线、压力、距离、湿度、温度、步数等)
+- x (可选): 三轴传感器的X轴值(如加速度、磁场、陀螺仪等)
+- y (可选): 三轴传感器的Y轴值
+- z (可选): 三轴传感器的Z轴值
+
+常用传感器类型:
+- 1: TYPE_ACCELEROMETER 加速度传感器
+- 2: TYPE_MAGNETIC_FIELD 磁场传感器
+- 4: TYPE_GYROSCOPE 陀螺仪传感器
+- 5: TYPE_LIGHT 光线传感器
+- 6: TYPE_PRESSURE 压力传感器
+- 8: TYPE_PROXIMITY 距离传感器
+- 12: TYPE_RELATIVE_HUMIDITY 湿度传感器
+- 13: TYPE_AMBIENT_TEMPERATURE 温度传感器
+- 19: TYPE_STEP_COUNTER 步数计数传感器
+
+请求示例:
+{
+  "sensors": [
+    {"type": 5, "value": 100.0},
+    {"type": 2, "x": 1.0, "y": 2.0, "z": 3.0}
+  ]
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "ss123456"
+}
+
+========================
+20. 账号管理 (Account)
+========================
+
+## 添加账号
+POST /account/add
+
+参数:
+- name (必填): 账号名(如example@gmail.com)
+- type (必填): 账号类型(如com.google)
+- password (可选): 密码
+- user_data (可选): 用户自定义数据(Key-Value)
+
+请求示例:
+{
+  "name": "test_user",
+  "type": "com.example.account",
+  "password": "password123",
+  "user_data": {"key1": "value1"}
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "name": "test_user",
+    "type": "com.example.account"
+  },
+  "msg": "OK",
+  "request_id": "aa123456"
+}
+
+## 获取账号列表
+GET /account/list
+GET /account/list?type=com.google
+
+参数:
+- type (可选): 过滤账号类型
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "count": 1,
+    "accounts": [
+      {"name": "test_user", "type": "com.example.account"}
+    ]
+  },
+  "msg": "OK",
+  "request_id": "al123456"
+}
+
+## 删除账号
+POST /account/delete
+
+参数:
+- name (必填): 账号名
+- type (必填): 账号类型
+
+请求示例:
+{
+  "name": "test_user",
+  "type": "com.example.account"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "name": "test_user",
+    "type": "com.example.account"
+  },
+  "msg": "OK",
+  "request_id": "ad123456"
+}
+
+========================
+21. 多媒体与音频 (Media)
+========================
+
+## 设置音量
+POST /media/set_volume
+
+参数:
+- stream_type (必填): 音量类型(music=媒体,voice_call=通话,ring=铃声,alarm=闹钟,notification=通知)
+- volume (必填): 音量值(0到最大值)
+- show_ui (可选): 是否显示系统音量UI,默认true
+
+请求示例:
+{
+  "stream_type": "music",
+  "volume": 8
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "stream_type": "music",
+    "volume": 8
+  },
+  "msg": "OK",
+  "request_id": "sv123456"
+}
+
+## 静音/取消静音
+POST /media/mute
+
+参数:
+- mute (必填): true=静音, false=取消静音
+
+请求示例:
+{
+  "mute": true
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {"mute": true},
+  "msg": "OK",
+  "request_id": "mu123456"
+}
+
+## 获取音量信息
+GET /media/get_volume
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "music": {"current": 8, "max": 15},
+    "voice_call": {"current": 5, "max": 10},
+    "ring": {"current": 10, "max": 15},
+    "is_mute": false
+  },
+  "msg": "OK",
+  "request_id": "vi123456"
+}
+
+========================
+22. 无障碍 (Accessibility)
+========================
+
+## 导出UI层次结构
+GET /accessibility/dump
+
+兼容调用: POST /accessibility/dump,body={}
+
+返回示例:
+{
+  "code": 200,
+  "data": "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy ...",
+  "msg": "OK",
+  "request_id": "r8s9t0u1v2w3x4y5z6a7"
+}
+
+## UI 节点操作
+POST /accessibility/node
+
+说明: 统一的节点操作接口，支持查找和执行动作，需要镜像版本20260113及以上
+
+参数:
+- selector (必填): 节点选择器
+  - xpath (可选): XPath 表达式，优先级最高
+  - text (可选): 节点文本，支持正则
+  - content_desc (可选): 节点内容描述，支持正则
+  - name (可选): 节点文本或内容描述，支持正则
+  - resource_id (可选): 资源ID
+  - package (可选): 包名
+  - class (可选): 类名
+  - clickable, enabled, scrollable, focusable, focused, selected, checkable, checked (可选): boolean状态
+  - index (可选): 节点在父容器中的索引
+  - center_x, center_y (可选): 节点中心坐标
+- action (可选): 执行动作，不传则仅返回节点信息
+  - 支持动作: click, long_click, set_text, scroll_forward, scroll_backward, copy, paste, cut, set_selection, clear_focus, focus
+- action_params (可选): 动作参数
+  - text: set_text动作的文本
+  - start, end: set_selection动作的起始位置
+- wait_timeout (可选): 等待超时时间(ms)，默认0
+- wait_interval (可选): 重试间隔(ms)，默认1000
+- action_index (可选): 对第几个匹配的节点执行动作，默认0
+
+请求示例 (文本精准匹配并点击):
+{
+  "selector": {
+    "text": "设置"
+  },
+  "action": "click"
+}
+
+请求示例 (XPath 匹配):
+{
+  "selector": {
+    "xpath": "//node[@text='设置' and @clickable='true']"
+  },
+  "action": "click"
+}
+
+请求示例 (等待并设置文本):
+{
+  "selector": {
+    "resource_id": "com.example:id/input"
+  },
+  "wait_timeout": 5000,
+  "action": "set_text",
+  "action_params": {
+    "text": "Hello"
+  }
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "success": true,
+    "nodes": [
+      {
+        "text": "设置",
+        "package": "com.android.settings",
+        "class": "android.widget.TextView",
+        "resource_id": "com.android.settings:id/title",
+        "bounds": {"left": 100, "top": 200, "right": 300, "bottom": 400},
+        "clickable": true
+      }
+    ],
+    "action_performed": true
+  },
+  "msg": "OK",
+  "request_id": "an123456"
+}
+
+## 设置无障碍服务隐藏状态
+POST /accessibility/set_hidden
+
+说明: 需要镜像版本20260113及以上
+
+参数:
+- package_names (必填): 无障碍服务包名数组
+- hidden (可选): 是否隐藏,默认true
+
+请求示例:
+{
+  "package_names": ["com.example.service1", "com.example.service2"],
+  "hidden": true
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": ["com.example.service1", "com.example.service2"],
+  "msg": "OK",
+  "request_id": "sh123456"
+}
+
+## 获取无障碍服务隐藏状态
+GET /accessibility/get_hidden
+
+说明: 需要镜像版本20260113及以上
+
+返回示例:
+{
+  "code": 200,
+  "data": ["com.example.service1", "com.example.service2"],
+  "msg": "OK",
+  "request_id": "gh123456"
+}
+
+========================
+23. 通知管理 (Notification)
+========================
+
+## 获取活跃通知列表
+GET /notification/list
+GET /notification/list?package_name=com.android.settings
+
+参数:
+- package_name (可选): 过滤指定应用的通知
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "count": 1,
+    "notifications": [
+      {
+        "package_name": "com.android.settings",
+        "id": 1,
+        "key": "0|com.android.settings|1|null|1000",
+        "title": "通知标题",
+        "text": "通知内容",
+        "post_time": 1736412345000,
+        "is_ongoing": false,
+        "is_clearable": true,
+        "priority": 0
+      }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "v2w3x4y5z6a7b8c9d0e1"
+}
+
+## 获取应用通知渠道列表
+GET /notification/channels?package_name=com.example.app
+
+参数:
+- package_name (必填): 应用包名
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "package_name": "com.example.app",
+    "count": 1,
+    "channels": [
+      {
+        "id": "channel_id",
+        "name": "渠道名称",
+        "importance": 3,
+        "description": "渠道描述"
+      }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "nc123456"
+}
+
+========================
+24. 设备信息 (Device)
+========================
+
+## 随机机型信息
+POST /device/random_model
+
+说明: 仅支持虚拟机类型云机
+
+参数:
+- is_china (可选): 是否仅随机中国机型,默认false
+
+请求示例:
+{
+  "is_china": true
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "manufacturer": "Xiaomi",
+    "model": "MI 11",
+    "brand": "Xiaomi",
+    "device": "cetus",
+    "product": "cetus",
+    "hardware": "qcom"
+  },
+  "msg": "OK",
+  "request_id": "s9t0u1v2w3x4y5z6a7b8"
+}
+
+========================
+25. Google服务 (Google)
+========================
+
+## 启用/禁用谷歌套件
+POST /google/set_enabled
+
+参数:
+- enabled (必填): true=启用, false=禁用
+
+请求示例:
+{
+  "enabled": true
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "gs123456"
+}
+
+## 重置GAID
+POST /google/reset_gaid
+
+参数:
+- gaid (可选): 指定GAID,不传则随机生成
+
+请求示例:
+{
+  "gaid": "550e8400-e29b-41d4-a716-446655440000"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": "550e8400-e29b-41d4-a716-446655440000",
+  "msg": "OK",
+  "request_id": "gr123456"
+}
+
+## 获取谷歌套件启用状态
+GET /google/get_enabled
+
+返回示例:
+{
+  "code": 200,
+  "data": true,
+  "msg": "OK",
+  "request_id": "gst123456"
+}
+
+========================
+26. AI Agent
+========================
+
+AI Agent是基于大语言模型(LLM)的智能任务执行引擎,能够自主理解用户意图并通过工具调用完成复杂的Android设备操作任务。
+
+--- 配置管理 ---
+
+## 设置API配置
+POST /ai_agent/config_set
+
+说明: 设置AI Agent的LLM API配置。至少需要提供一个配置参数,仅更新传入的字段。
+
+参数:
+- provider (可选): LLM提供商(如dashscope、openai、anthropic)
+- model (可选): 模型名称(如qwen-flash、gpt-4o)
+- base_url (可选): API基础URL
+- api_key (可选): API Key
+- max_turns (可选): 最大工具调用轮次,默认50
+- system_prompt (可选): 系统提示词
+- api_type (可选): API类型,chat_completions(默认)或responses
+
+请求示例:
+{
+  "provider": "openai",
+  "model": "gpt-4o",
+  "base_url": "https://api.openai.com/v1",
+  "api_key": "sk-xxxxx"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": { "saved": true },
+  "msg": "OK",
+  "request_id": "ag123456"
+}
+
+## 获取API配置
+POST /ai_agent/config_get
+
+说明: 获取当前AI Agent的API配置信息。
+
+参数: 无
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "provider": "openai",
+    "model": "gpt-4o",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "sk-xxxxx",
+    "max_turns": 50,
+    "api_type": "chat_completions"
+  },
+  "msg": "OK",
+  "request_id": "ag234567"
+}
+
+--- 任务管理 ---
+
+## 启动任务
+POST /ai_agent/task_run
+
+说明: 异步启动AI Agent任务,立即返回task_id。可通过SSE端点/api/ai_agent/task_stream?task_id=xxx获取实时进度。使用前需先通过config_set设置API配置。
+
+参数:
+- content (必填): 任务描述(自然语言),Desktop 2.2.8使用此字段
+- model (可选): 覆盖配置中的模型名称
+- max_turns (可选): 覆盖配置中的最大轮次
+- system_prompt (可选): 覆盖配置中的系统提示词
+- api_type (可选): 覆盖配置中的API类型
+
+请求示例:
+{
+  "content": "打开设置,查看当前WiFi名称"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "task_id": "r_abc123",
+    "status": "running"
+  },
+  "msg": "OK",
+  "request_id": "ag345678"
+}
+
+## 查询任务状态
+POST /ai_agent/task_status
+
+说明: 获取当前运行中任务的状态和已累积的事件列表,适用于客户端断线重连场景。
+
+参数: 无
+
+返回示例(运行中):
+{
+  "code": 200,
+  "data": {
+    "task_id": "r_abc123",
+    "status": "running",
+    "task": "打开设置,查看当前WiFi名称",
+    "created_at": 1709000000000,
+    "finished_at": 0,
+    "events": [
+      { "taskId": "r_abc123", "type": "RUN_STARTED", "timestamp": 1709000000100 },
+      { "taskId": "r_abc123", "type": "LLM_RESPONSE", "turn": 1, "content": "我需要先打开设置应用", "toolCalls": [{"id": "call_001", "name": "activity_start", "arguments": "{\"package_name\":\"com.android.settings\"}"}], "timestamp": 1709000002000 }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "ag456789"
+}
+
+返回示例(空闲):
+{
+  "code": 200,
+  "data": {
+    "status": "idle",
+    "message": "当前没有运行中的任务"
+  },
+  "msg": "OK",
+  "request_id": "ag567890"
+}
+
+事件类型说明:
+- run_started: 任务开始
+- turn_start: 新一轮开始
+- llm_response: LLM响应(含content文字和toolCalls工具调用)
+- tool_call_start: 工具调用开始
+- tool_call_result: 工具调用结果
+- run_completed: 任务完成
+- run_failed: 任务失败
+
+## 停止任务
+POST /ai_agent/task_stop
+
+说明: 通过task_id停止指定的正在执行的任务。
+
+参数:
+- task_id (必填): 任务ID
+
+请求示例:
+{
+  "task_id": "r_abc123"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "stopped": true,
+    "task_id": "r_abc123"
+  },
+  "msg": "OK",
+  "request_id": "ag678901"
+}
+
+## 查询任务列表
+POST /ai_agent/task_list
+
+说明: 查询AI Agent的任务列表。
+
+参数:
+- limit (可选): 返回记录数量上限,默认20
+
+请求示例:
+{
+  "limit": 10
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "tasks": [
+      {
+        "task_id": "r_abc123",
+        "task": "打开设置,查看当前WiFi名称",
+        "status": "completed",
+        "created_at": 1709000000000,
+        "finished_at": 1709000015000
+      }
+    ]
+  },
+  "msg": "OK",
+  "request_id": "ag890123"
+}
+
+## 查询任务详情
+POST /ai_agent/task_detail
+
+参数:
+- task_id (必填): 任务ID
+
+请求示例:
+{"task_id":"r_abc123"}
+
+返回data:
+{"events":[...]}
+
+## 删除任务
+POST /ai_agent/task_delete
+
+参数:
+- task_id (必填): 任务ID,运行中的任务应先停止
+
+## 订阅任务事件流
+GET /ai_agent/task_stream?task_id={task_id}
+Content-Type: text/event-stream
+
+外部完整路径:
+http://{主机IP}:18182/android_api/v2/{云机ID}/ai_agent/task_stream?task_id={task_id}
+
+云机内完整路径:
+http://127.0.0.1:18185/api/ai_agent/task_stream?task_id={task_id}
+
+断线后使用task_status或task_detail恢复状态。
+
+--- 技能管理 ---
+
+技能(Skill)是Markdown格式的指令文本,用于指导AI Agent完成特定类型的任务。
+技能来源: builtin(内置,不可卸载) / external(外部安装,存储在设备上)
+
+## 获取技能列表
+POST /ai/skill_list
+
+说明: 列出所有可用技能(含来源标识)。
+
+参数: 无
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "skills": [
+      { "name": "open_app", "display_name": "打开应用", "description": "打开指定应用", "scenarios": "当用户要求打开某个应用时使用", "source": "builtin" },
+      { "name": "my_custom_skill", "display_name": "自定义技能", "description": "自定义技能", "scenarios": "自定义场景", "source": "external" }
+    ],
+    "count": 2
+  },
+  "msg": "OK",
+  "request_id": "sk123456"
+}
+
+## 获取技能详情
+POST /ai/skill_get
+
+说明: 获取指定技能的详情(含完整Markdown内容)。
+
+参数:
+- name (必填): 技能名称
+
+请求示例:
+{
+  "name": "open_app"
+}
+
+返回示例:
+{
+  "code": 200,
+  "data": {
+    "name": "open_app",
+    "display_name": "打开应用",
+    "description": "打开指定应用",
+    "scenarios": "当用户要求打开某个应用时使用",
+    "source": "builtin",
+    "observe_mode": "screenshot",
+    "content": "# 打开应用\n\n## 步骤\n1. 获取应用列表\n2. 启动目标应用..."
+  },
+  "msg": "OK",
+  "request_id": "sk234567"
+}
+
+错误返回: 技能不存在时返回HTTP 400
+
+## 安装技能
+POST /ai/skill_install
+
+说明: 安装或更新一个外部技能。同名技能已存在时覆盖更新。
+
+参数:
+- name (必填): 技能名称,只允许字母、数字、下划线和短横线
+- content (必填): 技能内容(Markdown格式)
+
+请求示例:
+{
+  "name": "my_custom_skill",
+  "content": "# 自定义技能\n\n## 描述\n这是一个自定义技能\n\n## 步骤\n1. 执行操作A\n2. 执行操作B"
+}
+
+返回示例(成功):
+{
+  "code": 200,
+  "data": { "name": "my_custom_skill" },
+  "msg": "OK",
+  "request_id": "sk456789"
+}
+
+错误返回: 参数缺失或名称不合法返回HTTP 400,操作失败返回HTTP 500
+
+## 卸载技能
+POST /ai/skill_uninstall
+
+说明: 卸载一个外部技能。内置技能不可卸载。
+
+参数:
+- name (必填): 技能名称
+
+请求示例:
+{
+  "name": "my_custom_skill"
+}
+
+返回示例(成功):
+{
+  "code": 200,
+  "data": { "name": "my_custom_skill" },
+  "msg": "OK",
+  "request_id": "sk678901"
+}
+
+错误返回: 参数缺失或技能不存在返回HTTP 400,内置技能不可卸载返回HTTP 501,操作失败返回HTTP 500
+
+========================
+27. 典型开发流程示例
+========================
+
+示例A: 启动应用并等待
+1) POST /android_api/v2/{db_id}/activity/start
+   body: {"package_name": "com.android.settings"}
+2) POST /android_api/v2/{db_id}/base/sleep
+   body: {"duration": 2000}
+
+示例B: 使用工作流执行一系列操作
+1) POST /android_api/v2/{db_id}/workflow
+   body: {
+     "actions": [
+       {"path": "activity/start", "params": {"package_name": "com.android.settings"}},
+       {"path": "base/sleep", "params": {"duration": 2000}},
+       {"path": "input/click", "params": {"x": 500, "y": 800}}
+     ]
+   }
+
+示例C: 安装APK并启动
+1) POST /android_api/v2/{db_id}/package/install_sync (multipart)
+   file: app.apk
+2) 等待返回成功
+3) POST /android_api/v2/{db_id}/activity/start
+   body: {"package_name": "com.example.app"}
+
+示例D: 设置GPS并验证
+1) POST /android_api/v2/{db_id}/location/set_data
+   body: {"latitude": 39.9042, "longitude": 116.4074, "enabled": true}
+2) GET /android_api/v2/{db_id}/location/get_data
+3) 验证返回的latitude和longitude
+
+示例E: 查找UI节点并点击
+1) POST /android_api/v2/{db_id}/accessibility/node
+   body: {
+     "selector": {"text": "设置", "clickable": true},
+     "action": "click"
+   }
+
+注意事项:
+- 云机外调用使用/android_api/v2/{db_id}/前缀
+- 云机内调用使用/api/前缀(localhost:18185)
+- 工作流可以组合多个操作,按顺序执行
+- 所有接口都返回request_id,便于追踪和排查
+- 需要镜像版本支持的接口请确认版本号
+
+========================
+28. 错误处理建议
+========================
+
+1. 检查code字段判断成功/失败
+2. 保存request_id用于问题排查
+3. 参数错误时检查参数类型和值范围
+4. 接口不存在时检查镜像版本是否支持
+5. 操作失败时查看msg字段获取详细说明
+
+========================
+29. 性能优化建议
+========================
+
+1. 使用工作流组合多个操作,减少网络开销
+2. 批量操作优先使用批量接口(如批量添加联系人)
+3. 查找UI节点时使用精准条件,避免全屏扫描
+4. 合理使用sleep避免操作过快导致失败

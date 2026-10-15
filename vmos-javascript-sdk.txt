@@ -1,0 +1,929 @@
+VMOS Edge JavaScript SDK - AI快速参考
+版本: 2026-02-04
+语言: zh-CN
+
+========================
+1. 基础信息
+========================
+
+SDK名称: @vmosedge/web-sdk
+
+安装方式:
+npm install @vmosedge/web-sdk
+pnpm add @vmosedge/web-sdk
+yarn add @vmosedge/web-sdk
+
+支持环境:
+- 本地文件协议 (file://)
+- localhost 或 127.0.0.1
+- 不支持 HTTP 和 HTTPS 协议 (localhost除外)
+
+推荐使用场景:
+- Electron 应用
+- Tauri 应用
+- 其他支持 WebView 的桌面应用框架
+
+功能特性:
+- 实时视频流 (WebGL/Canvas 2D渲染)
+- 低延迟触控控制
+- 设备控制 (按键、文本输入、剪贴板)
+- 群控功能
+- 完整事件系统
+- TypeScript 支持
+
+注意事项:
+- 当前版本暂不支持音频流传输
+- 仅支持视频流和触控控制
+
+========================
+2. 环境检测
+========================
+
+使用SDK前必须检测环境是否支持:
+
+JavaScript示例:
+import { VmosEdgeClient } from "@vmosedge/web-sdk";
+
+if (!VmosEdgeClient.isWebCodecsSupported()) {
+  console.error("当前环境不支持 SDK 使用");
+  console.error("请使用 file:// 协议打开 HTML 文件，或通过 localhost 访问");
+  return;
+}
+
+// 环境支持,可以继续使用 SDK
+
+========================
+3. 核心类和类型
+========================
+
+## 核心类
+- VmosEdgeClient: 主客户端类
+
+## 配置类型 (TypeScript)
+- VmosEdgeClientConfig: 设备连接配置
+- VmosEdgeClientOptions: 客户端初始化选项
+- VmosEdgeSizeChangedEvent: 尺寸变化事件数据
+- VmosEdgeErrorEvent: 错误事件数据
+- VmosEdgeChannelConnectedEvent: 通道连接事件数据
+- ChannelStatus: 通道状态类型
+- AllChannelsStatus: 所有通道状态类型
+
+## 枚举和常量
+- VmosEdgeClientEvents: 事件名称枚举
+- VmosEdgeErrorCode: 错误代码枚举
+- VmosEdgeErrorType: 错误类型枚举
+
+## Android控制相关枚举
+- AndroidKeyCode: Android按键码枚举
+- AndroidKeyEventAction: 按键动作枚举
+- AndroidMotionEventAction: 触摸动作枚举
+- AndroidMotionEventButton: 触摸按钮枚举
+- AndroidMetaState: 元键状态枚举
+
+========================
+4. 快速开始
+========================
+
+## 局域网模式示例
+
+JavaScript:
+import { VmosEdgeClient, VmosEdgeClientEvents } from "@vmosedge/web-sdk";
+
+// 0. 环境检测
+if (!VmosEdgeClient.isWebCodecsSupported()) {
+  console.error("当前环境不支持 SDK 使用");
+  return;
+}
+
+// 1. 准备DOM容器
+const container = document.getElementById("device-container");
+
+// 2. 创建客户端实例 (局域网模式: network_mode === 'macvlan')
+const client = new VmosEdgeClient({
+  container: container,
+  config: {
+    ip: "192.168.1.100",              // 设备的ip字段
+    deviceId: "EDGE418ASOC2LX9C",     // 设备的dbid字段
+    ports: {
+      video: 9999,                    // 局域网模式固定端口
+      touch: 9997,                    // 局域网模式固定端口
+    },
+  },
+});
+
+// 3. 监听连接成功事件
+client.on(VmosEdgeClientEvents.STARTED, () => {
+  console.log("设备连接成功！");
+});
+
+// 4. 启动连接
+client.start();
+
+## 非局域网模式示例
+
+JavaScript:
+import { VmosEdgeClient, VmosEdgeClientEvents } from "@vmosedge/web-sdk";
+
+// 0. 环境检测
+if (!VmosEdgeClient.isWebCodecsSupported()) {
+  console.error("当前环境不支持 SDK 使用");
+  return;
+}
+
+// 1. 准备DOM容器
+const container = document.getElementById("device-container");
+
+// 2. 创建客户端实例 (非局域网模式)
+const client = new VmosEdgeClient({
+  container: container,
+  config: {
+    ip: "example.com",                // 设备的hostip字段
+    deviceId: "EDGE418ASOC2LX9C",     // 设备的dbid字段
+    ports: {
+      video: 22003,                   // 设备的tcp_port字段
+      touch: 24003,                   // 设备的tcp_control_port字段
+    },
+  },
+});
+
+// 3. 监听连接成功事件
+client.on(VmosEdgeClientEvents.STARTED, () => {
+  console.log("设备连接成功！");
+});
+
+// 4. 启动连接
+client.start();
+
+========================
+5. 配置说明
+========================
+
+VmosEdgeClientConfig 配置项:
+
+必填项:
+- ip: 设备IP地址或域名
+  - 局域网模式: 使用设备的ip字段
+  - 非局域网模式: 使用设备的hostip字段
+- deviceId: 设备ID (对应设备的dbid字段)
+- ports: 端口配置对象
+  - video: 视频流端口
+    - 局域网模式: 固定为9999
+    - 非局域网模式: 使用设备的tcp_port字段
+  - touch: 触控端口
+    - 局域网模式: 固定为9997
+    - 非局域网模式: 使用设备的tcp_control_port字段
+
+可选项:
+- protocol: 协议类型 (默认"ws")
+- enableTouch: 是否启用触控 (默认true)
+- enableAudio: 是否启用音频 (默认false, 当前版本暂不支持)
+
+VmosEdgeClientOptions 配置项:
+
+必填项:
+- container: DOM容器元素 (HTMLElement)
+- config: 设备连接配置 (VmosEdgeClientConfig)
+
+可选项:
+- renderMode: 渲染模式 ("webgl" | "canvas2d" | "auto", 默认"auto")
+- debug: 是否启用调试模式 (默认false)
+- autoReconnect: 是否自动重连 (默认true)
+- reconnectInterval: 重连间隔(ms) (默认3000)
+- maxReconnectAttempts: 最大重连次数 (默认5)
+
+========================
+6. API方法
+========================
+
+## 静态方法
+
+VmosEdgeClient.isWebCodecsSupported(): boolean
+说明: 检测当前环境是否支持 SDK
+返回: true=支持, false=不支持
+
+## 实例方法 - 生命周期管理
+
+start(): Promise<void>
+说明: 启动连接
+返回: Promise
+
+stop(): Promise<void>
+说明: 停止连接
+返回: Promise
+
+destroy(): void
+说明: 销毁客户端实例
+注意: 销毁后实例不可再使用
+
+## 实例方法 - 输入控制
+
+sendTouchDown(x: number, y: number, pointerId?: number): void
+说明: 发送触摸按下事件
+参数:
+- x: X坐标
+- y: Y坐标
+- pointerId: 触点ID (可选, 默认0)
+
+sendTouchMove(x: number, y: number, pointerId?: number): void
+说明: 发送触摸移动事件
+参数:
+- x: X坐标
+- y: Y坐标
+- pointerId: 触点ID (可选, 默认0)
+
+sendTouchUp(pointerId?: number): void
+说明: 发送触摸抬起事件
+参数:
+- pointerId: 触点ID (可选, 默认0)
+
+sendClick(x: number, y: number): void
+说明: 发送点击事件 (组合down+up)
+参数:
+- x: X坐标
+- y: Y坐标
+
+sendSwipe(startX: number, startY: number, endX: number, endY: number, duration?: number): Promise<void>
+说明: 发送滑动事件
+参数:
+- startX: 起点X坐标
+- startY: 起点Y坐标
+- endX: 终点X坐标
+- endY: 终点Y坐标
+- duration: 持续时间(ms) (可选, 默认300)
+返回: Promise
+
+sendKeyEvent(keyCode: AndroidKeyCode, action: AndroidKeyEventAction): void
+说明: 发送按键事件
+参数:
+- keyCode: Android按键码
+- action: 按键动作 (DOWN=0, UP=1)
+
+sendKeyPress(keyCode: AndroidKeyCode): void
+说明: 发送按键按下并抬起 (组合down+up)
+参数:
+- keyCode: Android按键码
+
+sendText(text: string): void
+说明: 发送文本输入
+参数:
+- text: 要输入的文本
+
+## 实例方法 - 设备控制
+
+pressBack(): void
+说明: 按返回键
+
+pressHome(): void
+说明: 按Home键
+
+pressMenu(): void
+说明: 按菜单键
+
+pressRecentApps(): void
+说明: 按最近任务键
+
+volumeUp(): void
+说明: 音量+
+
+volumeDown(): void
+说明: 音量-
+
+volumeMute(): void
+说明: 静音
+
+powerButton(): void
+说明: 电源键
+
+lockScreen(): void
+说明: 锁屏
+
+unlockScreen(): void
+说明: 解锁屏幕
+
+## 实例方法 - 状态查询
+
+isConnected(): boolean
+说明: 是否已连接
+返回: true=已连接, false=未连接
+
+getConnectionStatus(): AllChannelsStatus
+说明: 获取所有通道连接状态
+返回: 包含video和touch通道状态的对象
+
+getDeviceSize(): { width: number; height: number } | null
+说明: 获取设备屏幕尺寸
+返回: {width, height} 或 null (未连接时)
+
+## 实例方法 - 事件管理
+
+on<K extends keyof VmosEdgeClientEventMap>(
+  event: K,
+  listener: VmosEdgeClientEventListener<K>
+): void
+说明: 监听事件
+参数:
+- event: 事件名称
+- listener: 事件监听器函数
+
+off<K extends keyof VmosEdgeClientEventMap>(
+  event: K,
+  listener: VmosEdgeClientEventListener<K>
+): void
+说明: 移除事件监听
+参数:
+- event: 事件名称
+- listener: 事件监听器函数
+
+once<K extends keyof VmosEdgeClientEventMap>(
+  event: K,
+  listener: VmosEdgeClientEventListener<K>
+): void
+说明: 监听一次性事件 (触发后自动移除)
+参数:
+- event: 事件名称
+- listener: 事件监听器函数
+
+========================
+7. 事件系统
+========================
+
+## 生命周期事件
+
+VmosEdgeClientEvents.STARTING = "starting"
+说明: 开始连接
+触发时机: 调用start()方法后
+
+VmosEdgeClientEvents.STARTED = "started"
+说明: 连接成功
+触发时机: 所有通道连接成功后
+
+VmosEdgeClientEvents.STOPPING = "stopping"
+说明: 开始停止
+触发时机: 调用stop()方法后
+
+VmosEdgeClientEvents.STOPPED = "stopped"
+说明: 已停止
+触发时机: 所有通道关闭后
+
+## 连接状态事件
+
+VmosEdgeClientEvents.CHANNEL_CONNECTING = "channel_connecting"
+说明: 通道连接中
+事件数据: VmosEdgeChannelConnectedEvent
+- channel: "video" | "touch"
+
+VmosEdgeClientEvents.CHANNEL_CONNECTED = "channel_connected"
+说明: 通道已连接
+事件数据: VmosEdgeChannelConnectedEvent
+- channel: "video" | "touch"
+
+VmosEdgeClientEvents.CHANNEL_DISCONNECTED = "channel_disconnected"
+说明: 通道断开连接
+事件数据: VmosEdgeChannelConnectedEvent
+- channel: "video" | "touch"
+
+VmosEdgeClientEvents.CHANNEL_ERROR = "channel_error"
+说明: 通道错误
+事件数据: VmosEdgeErrorEvent
+- code: 错误代码
+- type: 错误类型
+- message: 错误消息
+- channel: "video" | "touch"
+
+## 重连事件
+
+VmosEdgeClientEvents.RECONNECTING = "reconnecting"
+说明: 正在重连
+事件数据: {attempt: number, maxAttempts: number}
+
+VmosEdgeClientEvents.RECONNECTED = "reconnected"
+说明: 重连成功
+
+VmosEdgeClientEvents.RECONNECT_FAILED = "reconnect_failed"
+说明: 重连失败 (达到最大重连次数)
+
+## 视频流事件
+
+VmosEdgeClientEvents.VIDEO_SIZE_CHANGED = "video_size_changed"
+说明: 视频尺寸变化
+事件数据: VmosEdgeSizeChangedEvent
+- width: 宽度
+- height: 高度
+
+VmosEdgeClientEvents.VIDEO_FRAME_DECODED = "video_frame_decoded"
+说明: 视频帧解码完成
+事件数据: VideoFrame
+
+## 错误事件
+
+VmosEdgeClientEvents.ERROR = "error"
+说明: 通用错误
+事件数据: VmosEdgeErrorEvent
+- code: 错误代码
+- type: 错误类型
+- message: 错误消息
+
+## 事件使用示例
+
+JavaScript:
+import { VmosEdgeClient, VmosEdgeClientEvents } from "@vmosedge/web-sdk";
+
+const client = new VmosEdgeClient({...});
+
+// 监听连接成功
+client.on(VmosEdgeClientEvents.STARTED, () => {
+  console.log("连接成功");
+});
+
+// 监听视频尺寸变化
+client.on(VmosEdgeClientEvents.VIDEO_SIZE_CHANGED, (event) => {
+  console.log(`视频尺寸: ${event.width}x${event.height}`);
+});
+
+// 监听错误
+client.on(VmosEdgeClientEvents.ERROR, (event) => {
+  console.error(`错误: ${event.message}`, event);
+});
+
+// 监听通道连接
+client.on(VmosEdgeClientEvents.CHANNEL_CONNECTED, (event) => {
+  console.log(`${event.channel} 通道已连接`);
+});
+
+// 监听重连
+client.on(VmosEdgeClientEvents.RECONNECTING, (event) => {
+  console.log(`正在重连 (${event.attempt}/${event.maxAttempts})`);
+});
+
+========================
+8. 错误码
+========================
+
+## 错误类型 (VmosEdgeErrorType)
+
+CONNECTION_ERROR = "connection_error"
+说明: 连接错误
+
+VIDEO_ERROR = "video_error"
+说明: 视频流错误
+
+TOUCH_ERROR = "touch_error"
+说明: 触控错误
+
+INITIALIZATION_ERROR = "initialization_error"
+说明: 初始化错误
+
+## 错误代码 (VmosEdgeErrorCode)
+
+UNKNOWN_ERROR = 1000
+说明: 未知错误
+
+WEBSOCKET_CONNECTION_FAILED = 2001
+说明: WebSocket连接失败
+
+WEBSOCKET_CLOSED = 2002
+说明: WebSocket连接关闭
+
+VIDEO_DECODER_ERROR = 3001
+说明: 视频解码器错误
+
+VIDEO_DECODE_ERROR = 3002
+说明: 视频解码错误
+
+VIDEO_RENDER_ERROR = 3003
+说明: 视频渲染错误
+
+TOUCH_SEND_ERROR = 4001
+说明: 触控事件发送失败
+
+CONTAINER_NOT_FOUND = 5001
+说明: 找不到容器元素
+
+INVALID_CONFIG = 5002
+说明: 配置无效
+
+WEBCODECS_NOT_SUPPORTED = 5003
+说明: 环境不支持WebCodecs
+
+========================
+9. Android按键码
+========================
+
+常用按键码 (AndroidKeyCode):
+
+KEYCODE_BACK = 4          // 返回键
+KEYCODE_HOME = 3          // Home键
+KEYCODE_MENU = 82         // 菜单键
+KEYCODE_POWER = 26        // 电源键
+KEYCODE_VOLUME_UP = 24    // 音量+
+KEYCODE_VOLUME_DOWN = 25  // 音量-
+KEYCODE_VOLUME_MUTE = 164 // 静音
+
+KEYCODE_0 = 7             // 数字0
+KEYCODE_1 = 8             // 数字1
+KEYCODE_2 = 9             // 数字2
+KEYCODE_3 = 10            // 数字3
+KEYCODE_4 = 11            // 数字4
+KEYCODE_5 = 12            // 数字5
+KEYCODE_6 = 13            // 数字6
+KEYCODE_7 = 14            // 数字7
+KEYCODE_8 = 15            // 数字8
+KEYCODE_9 = 16            // 数字9
+
+KEYCODE_A = 29            // 字母A
+KEYCODE_B = 30            // 字母B
+... (其他字母类推)
+
+KEYCODE_ENTER = 66        // 回车键
+KEYCODE_DEL = 67          // 删除键
+KEYCODE_SPACE = 62        // 空格键
+KEYCODE_TAB = 61          // Tab键
+KEYCODE_ESCAPE = 111      // ESC键
+
+KEYCODE_DPAD_UP = 19      // 方向上
+KEYCODE_DPAD_DOWN = 20    // 方向下
+KEYCODE_DPAD_LEFT = 21    // 方向左
+KEYCODE_DPAD_RIGHT = 22   // 方向右
+KEYCODE_DPAD_CENTER = 23  // 方向中
+
+按键动作 (AndroidKeyEventAction):
+DOWN = 0                  // 按下
+UP = 1                    // 抬起
+
+========================
+10. 典型开发流程示例
+========================
+
+示例A: 基础连接和控制
+
+JavaScript:
+import { VmosEdgeClient, VmosEdgeClientEvents, AndroidKeyCode } from "@vmosedge/web-sdk";
+
+// 1. 环境检测
+if (!VmosEdgeClient.isWebCodecsSupported()) {
+  alert("当前环境不支持 SDK");
+  return;
+}
+
+// 2. 创建客户端
+const container = document.getElementById("device-container");
+const client = new VmosEdgeClient({
+  container: container,
+  config: {
+    ip: "192.168.1.100",
+    deviceId: "EDGE418ASOC2LX9C",
+    ports: {
+      video: 9999,
+      touch: 9997,
+    },
+  },
+});
+
+// 3. 监听事件
+client.on(VmosEdgeClientEvents.STARTED, () => {
+  console.log("连接成功");
+  
+  // 连接成功后可以进行控制
+  setTimeout(() => {
+    client.pressHome();
+  }, 1000);
+});
+
+// 4. 启动连接
+client.start();
+
+示例B: 模拟滑动操作
+
+JavaScript:
+client.on(VmosEdgeClientEvents.STARTED, async () => {
+  // 等待2秒
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  
+  // 从屏幕底部向上滑动
+  const width = client.getDeviceSize().width;
+  const height = client.getDeviceSize().height;
+  
+  await client.sendSwipe(
+    width / 2,      // 起点X: 屏幕中间
+    height - 100,   // 起点Y: 底部
+    width / 2,      // 终点X: 屏幕中间
+    100,            // 终点Y: 顶部
+    500             // 持续500ms
+  );
+});
+
+示例C: 输入文本
+
+JavaScript:
+client.on(VmosEdgeClientEvents.STARTED, () => {
+  // 点击输入框
+  client.sendClick(500, 800);
+  
+  // 等待输入框获取焦点
+  setTimeout(() => {
+    // 输入文本
+    client.sendText("Hello World");
+  }, 500);
+});
+
+示例D: 群控多个设备
+
+JavaScript:
+const devices = [
+  {ip: "192.168.1.100", deviceId: "EDGE1"},
+  {ip: "192.168.1.101", deviceId: "EDGE2"},
+  {ip: "192.168.1.102", deviceId: "EDGE3"},
+];
+
+const clients = devices.map(device => {
+  const container = document.createElement("div");
+  container.style.width = "360px";
+  container.style.height = "640px";
+  document.body.appendChild(container);
+  
+  const client = new VmosEdgeClient({
+    container: container,
+    config: {
+      ip: device.ip,
+      deviceId: device.deviceId,
+      ports: {video: 9999, touch: 9997},
+    },
+  });
+  
+  client.on(VmosEdgeClientEvents.STARTED, () => {
+    console.log(`${device.deviceId} 连接成功`);
+  });
+  
+  client.start();
+  return client;
+});
+
+// 批量控制
+function pressBackOnAll() {
+  clients.forEach(client => client.pressBack());
+}
+
+function sendTextToAll(text) {
+  clients.forEach(client => client.sendText(text));
+}
+
+示例E: 错误处理和重连
+
+JavaScript:
+const client = new VmosEdgeClient({
+  container: container,
+  config: {...},
+  autoReconnect: true,
+  reconnectInterval: 3000,
+  maxReconnectAttempts: 5,
+});
+
+client.on(VmosEdgeClientEvents.ERROR, (event) => {
+  console.error("发生错误:", event);
+  
+  if (event.code === VmosEdgeErrorCode.WEBSOCKET_CONNECTION_FAILED) {
+    console.log("WebSocket连接失败，请检查网络");
+  }
+});
+
+client.on(VmosEdgeClientEvents.RECONNECTING, (event) => {
+  console.log(`正在重连 (${event.attempt}/${event.maxAttempts})`);
+});
+
+client.on(VmosEdgeClientEvents.RECONNECTED, () => {
+  console.log("重连成功");
+});
+
+client.on(VmosEdgeClientEvents.RECONNECT_FAILED, () => {
+  console.error("重连失败，请手动刷新页面");
+});
+
+示例F: React集成
+
+JavaScript:
+import React, { useEffect, useRef } from 'react';
+import { VmosEdgeClient, VmosEdgeClientEvents } from '@vmosedge/web-sdk';
+
+function DeviceScreen({ ip, deviceId }) {
+  const containerRef = useRef(null);
+  const clientRef = useRef(null);
+  
+  useEffect(() => {
+    // 环境检测
+    if (!VmosEdgeClient.isWebCodecsSupported()) {
+      alert("当前环境不支持 SDK");
+      return;
+    }
+    
+    // 创建客户端
+    const client = new VmosEdgeClient({
+      container: containerRef.current,
+      config: {
+        ip: ip,
+        deviceId: deviceId,
+        ports: {video: 9999, touch: 9997},
+      },
+    });
+    
+    clientRef.current = client;
+    
+    // 监听事件
+    client.on(VmosEdgeClientEvents.STARTED, () => {
+      console.log("连接成功");
+    });
+    
+    client.on(VmosEdgeClientEvents.ERROR, (event) => {
+      console.error("错误:", event);
+    });
+    
+    // 启动连接
+    client.start();
+    
+    // 清理
+    return () => {
+      client.destroy();
+    };
+  }, [ip, deviceId]);
+  
+  const handleBack = () => {
+    clientRef.current?.pressBack();
+  };
+  
+  const handleHome = () => {
+    clientRef.current?.pressHome();
+  };
+  
+  return (
+    <div>
+      <div ref={containerRef} style={{width: '360px', height: '640px'}} />
+      <button onClick={handleBack}>返回</button>
+      <button onClick={handleHome}>主页</button>
+    </div>
+  );
+}
+
+示例G: Vue集成
+
+JavaScript:
+<template>
+  <div>
+    <div ref="containerRef" style="width: 360px; height: 640px"></div>
+    <button @click="handleBack">返回</button>
+    <button @click="handleHome">主页</button>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, onUnmounted } from 'vue';
+import { VmosEdgeClient, VmosEdgeClientEvents } from '@vmosedge/web-sdk';
+
+const props = defineProps({
+  ip: String,
+  deviceId: String,
+});
+
+const containerRef = ref(null);
+let client = null;
+
+onMounted(() => {
+  // 环境检测
+  if (!VmosEdgeClient.isWebCodecsSupported()) {
+    alert("当前环境不支持 SDK");
+    return;
+  }
+  
+  // 创建客户端
+  client = new VmosEdgeClient({
+    container: containerRef.value,
+    config: {
+      ip: props.ip,
+      deviceId: props.deviceId,
+      ports: {video: 9999, touch: 9997},
+    },
+  });
+  
+  // 监听事件
+  client.on(VmosEdgeClientEvents.STARTED, () => {
+    console.log("连接成功");
+  });
+  
+  client.on(VmosEdgeClientEvents.ERROR, (event) => {
+    console.error("错误:", event);
+  });
+  
+  // 启动连接
+  client.start();
+});
+
+onUnmounted(() => {
+  client?.destroy();
+});
+
+const handleBack = () => {
+  client?.pressBack();
+};
+
+const handleHome = () => {
+  client?.pressHome();
+};
+</script>
+
+========================
+11. 注意事项
+========================
+
+1. 环境限制:
+   - 必须在file://协议或localhost环境下使用
+   - 不支持HTTP/HTTPS协议(localhost除外)
+   - 推荐使用Electron、Tauri等桌面应用框架
+
+2. 性能优化:
+   - 优先使用WebGL渲染模式
+   - 避免频繁创建/销毁客户端实例
+   - 群控场景建议限制同时连接数量
+
+3. 错误处理:
+   - 务必监听ERROR事件
+   - 建议启用autoReconnect
+   - 合理设置重连参数
+
+4. 触控控制:
+   - 坐标系基于设备屏幕尺寸
+   - 支持多点触控(通过pointerId区分)
+   - 滑动操作建议使用sendSwipe方法
+
+5. 生命周期管理:
+   - 组件卸载时务必调用destroy()
+   - 避免内存泄漏
+   - 正确管理事件监听器
+
+6. 网络配置:
+   - 局域网模式和非局域网模式端口不同
+   - 确保网络可达
+   - 防火墙需开放对应端口
+
+========================
+12. 性能优化建议
+========================
+
+1. 渲染优化:
+   - 使用auto模式让SDK自动选择最佳渲染方式
+   - WebGL性能优于Canvas2D
+   - 避免容器频繁重新布局
+
+2. 内存管理:
+   - 及时销毁不用的客户端实例
+   - 移除不需要的事件监听器
+   - 避免内存泄漏
+
+3. 网络优化:
+   - 使用局域网连接可获得更低延迟
+   - 确保网络带宽充足
+   - 避免网络拥塞
+
+4. 群控优化:
+   - 分批创建客户端实例
+   - 使用虚拟滚动显示大量设备
+   - 合理控制同时连接数
+
+========================
+13. 常见问题排查
+========================
+
+问题1: SDK无法使用
+解决: 检查是否在file://或localhost环境下,调用isWebCodecsSupported()检测
+
+问题2: 连接失败
+解决: 检查IP和端口是否正确,网络是否可达,防火墙是否开放端口
+
+问题3: 视频卡顿
+解决: 检查网络带宽,尝试减少同时连接数,优先使用局域网连接
+
+问题4: 触控不响应
+解决: 检查设备是否处于running状态,ROM是否就绪,enableTouch是否为true
+
+问题5: 内存占用过高
+解决: 检查是否正确销毁实例,移除事件监听器,控制同时连接数
+
+问题6: 重连失败
+解决: 检查autoReconnect配置,调整reconnectInterval和maxReconnectAttempts
+
+========================
+14. 错误处理建议
+========================
+
+1. 始终监听ERROR事件
+2. 根据错误类型和代码进行针对性处理
+3. 提供友好的错误提示给用户
+4. 记录错误日志便于排查
+5. 设置合理的重连策略
+
+========================
+15. 调试建议
+========================
+
+1. 启用debug模式查看详细日志
+2. 使用浏览器开发者工具查看网络请求
+3. 检查WebSocket连接状态
+4. 监听所有事件了解运行状态
+5. 使用try-catch捕获异常

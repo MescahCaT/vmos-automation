@@ -1,0 +1,17 @@
+{
+  "host_ip": "192.0.2.10",
+  "count": 1,
+  "default_config": {
+    "image_repository": "REPLACE_WITH_IMAGE_REPOSITORY",
+    "adiID": 0,
+    "resolution": {"dpi": 420, "fps": 60, "height": 1920, "width": 1080},
+    "selinux": false,
+    "dns": ["223.5.5.5", "223.6.6.6"],
+    "bool_gms_disabled": false,
+    "bool_gms_upgrade_enable": false
+  },
+  "devices": [
+    {"user_name": "proxy-example.1", "remark": "proxy-example.1"}
+  ],
+  "port_config": {"auto_allocate": false}
+}

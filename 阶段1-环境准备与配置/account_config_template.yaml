@@ -1,0 +1,8 @@
+# 旧YAML模板供参考。实际运行读取 配置文件/account_list.json。
+# 当前使用邮箱验证码登录，无需邮箱密码、IMAP或TikTok密码配置。
+accounts:
+  - email: "account@example.com"
+    login_mode: "email_code"
+    enabled: true
+# 主配置 tiktok.email_code.endpoint 保存网页取码端点。
+# GET时以 username 参数传入当前邮箱。验证码不保存到账号配置或日志。

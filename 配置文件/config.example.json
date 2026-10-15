@@ -1,0 +1,29 @@
+{
+  "vmos": {
+    "host_ip": "192.0.2.10",
+    "port": 18182,
+    "timeout": 10
+  },
+  "device": {
+    "count": 1,
+    "image_repository": "REPLACE_WITH_IMAGE_REPOSITORY",
+    "adiID": 0
+  },
+  "proxy": {
+    "config_file": "配置文件/proxy_list.json",
+    "probe_url": "https://api.ipify.org?format=json",
+    "probe_urls": ["https://www.tiktok.com/", "https://www.google.com/generate_204"],
+    "verify_rounds": 2,
+    "timeout": 20
+  },
+  "tiktok": {
+    "package_name": "com.zhiliaoapp.musically",
+    "apk_path": "阶段5-TikTok应用安装/tiktokdowmload/tiktok-43-7-2.apk",
+    "aapt_path": "C:/path/to/aapt.exe",
+    "account_file": "配置文件/account_list.json",
+    "email_code": {
+      "endpoint": "https://mail-api.example.com/code",
+      "timeout": 15
+    }
+  }
+}
