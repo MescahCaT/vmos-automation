@@ -6,6 +6,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,8 @@ from urllib.parse import urlsplit
 import requests
 
 ROOT = Path(__file__).resolve().parents[1]
+# 同一进程内的并发任务必须串行完成映射的读取、合并和替换。
+MAPPING_LOCK = threading.RLock()
 sys.path.insert(0, str(ROOT / "阶段1-环境准备与配置"))
 sys.path.insert(0, str(ROOT / "阶段5-TikTok应用安装"))
 sys.path.insert(0, str(ROOT / "阶段4-系统设置与环境配置"))
@@ -133,6 +136,7 @@ class ProxySetup:
         self.session = self.device.session
         self.device.log = self.log
         self.logs = []
+        self.control_bases = {}
 
     def log(self, message):
         line = f"[{timestamp()}] {message}"
@@ -150,7 +154,79 @@ class ProxySetup:
             raise ValueError(f"{action} 响应格式无效")
         return response.status_code, payload
 
-    def stop_proxy(self, db_id):
+    def control_api(self, method, action, db_id, body=None, timeout=30):
+        # bridge 实例可能有相同的容器IP；必须使用实例自己的映射端口。
+        if db_id not in self.control_bases:
+            instances = self.device.list_instances()
+            instance = instances.get(db_id)
+            if instance is None:
+                raise ValueError("目标云机不存在")
+            port = instance.get("http_api_port")
+            if type(port) is not int or not 1 <= port <= 65535:
+                raise ValueError("云机独立控制端口无效，未使用主机共享转发")
+            if any(key != db_id and item.get("http_api_port") == port for key, item in instances.items()):
+                raise ValueError("云机控制端口重复，未发送请求")
+            parts = urlsplit(self.host)
+            hostname = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+            self.control_bases[db_id] = parts._replace(netloc=f"{hostname}:{port}", path="/api", query="", fragment="").geturl()
+        response = self.session.request(method, self.control_bases[db_id] + "/" + action,
+                                        json=body, timeout=(5, timeout))
+        try:
+            payload = response.json()
+        except ValueError:
+            raise ValueError(f"{action} 返回非JSON（HTTP {response.status_code}）") from None
+        if not isinstance(payload, dict):
+            raise ValueError(f"{action} 响应格式无效")
+        return response.status_code, payload
+
+    def wait_android_ready(self, db_id, wait_time=60):
+        deadline = time.monotonic() + wait_time
+        while True:
+            try:
+                http, payload = self.api("POST", "shell", db_id, {"cmd": "getprop sys.boot_completed"}, timeout=10)
+                data = payload.get("data")
+                if (200 <= http < 300 and str(payload.get("code")) == "200" and isinstance(data, dict)
+                        and isinstance(data.get("message"), str) and data["message"].strip() == "1"):
+                    return
+            except (requests.RequestException, ValueError):
+                pass
+            if time.monotonic() >= deadline:
+                raise ValueError("Android启动尚未完成，未修改代理")
+            self.log("等待Android启动完成")
+            time.sleep(min(3, max(0, deadline - time.monotonic())))
+
+    def proxy_state(self, db_id, proxy=None):
+        if proxy is not None and proxy.get("engine_type", 0 if proxy.get("transit") else None) == 0:
+            http, payload = self.control_api("GET", "proxy/get", db_id)
+            data = payload.get("data")
+            # 云机自身的标准代理服务返回 enabled/nodes，不使用主机按容器IP查询的配置。
+            if str(payload.get("code")) == "200" and isinstance(data, dict) and type(data.get("enabled")) is bool:
+                payload = {"code": 200, "data": {"engineType": 0, "proxy_config": data}}
+            return http, payload, "control_proxy_get"
+        http, payload = self.api("GET", "cbs_proxy_get", db_id)
+        action = "cbs_proxy_get"
+        if http == 409 or str(payload.get("code")) == "409":
+            http, payload = self.api("GET", "proxy_get", db_id)
+            action = "proxy_get"
+        return http, payload, action
+
+    def stop_proxy(self, db_id, standard=False):
+        if standard:
+            try:
+                http, payload = self.control_api("POST", "proxy/set_enabled", db_id, {"enabled": False})
+            except requests.RequestException as error:
+                http, payload = 0, {"code": type(error).__name__}
+                self.log("旧代理停止响应不明确，独立回查关闭状态；未重发停止请求")
+            data = payload.get("data")
+            if (200 <= http < 300 and str(payload.get("code")) == "200"
+                    and isinstance(data, dict) and data.get("enabled") is False):
+                return
+            query_http, current = self.control_api("GET", "proxy/get", db_id)
+            data = current.get("data")
+            if (200 <= query_http < 300 and str(current.get("code")) == "200"
+                    and isinstance(data, dict) and data.get("enabled") is False):
+                return
+            raise ValueError(f"旧代理停止未确认（HTTP {http}，业务码 {payload.get('code')}），云机独立回查也未确认已关闭")
         http, payload = self.api("GET", "proxy_stop", db_id)
         if 200 <= http < 300 and str(payload.get("code")) == "200":
             return
@@ -169,14 +245,23 @@ class ProxySetup:
     def apply(self, db_id, body, proxy=None, engine_type=2):
         if proxy is not None and proxy.get("transit") is not None and engine_type != 0:
             engine_type = 2
-        if engine_type in (0, 1):
+        if engine_type == 0:
+            if proxy is None:
+                raise ValueError("标准代理配置缺少代理资源")
+            self.stop_proxy(db_id, standard=True)
+            http, payload = self.control_api("POST", "proxy/set_enabled", db_id,
+                                             dict(legacy_proxy_body(proxy), enabled=True))
+            safe = {"http_status": http, "code": payload.get("code"),
+                    "accepted": str(payload.get("code")) == "200", "engine": "standard", "transport": "instance_port"}
+            if not 200 <= http < 300 or not safe["accepted"]:
+                raise ValueError(f"标准代理配置被拒绝（HTTP {http}，业务码 {safe['code']}）")
+            return safe
+        if engine_type == 1:
             if proxy is None:
                 raise ValueError("legacy代理配置缺少代理资源")
             # legacy 引擎需要先停旧绑定再重挂；否则部分主机会保留记录但不恢复透明路由。
             self.stop_proxy(db_id)
             legacy_body = legacy_proxy_body(proxy)
-            if engine_type == 0:
-                legacy_body["engineType"] = 0
             http, payload = self.api("POST", "proxy_set", db_id, legacy_body)
             safe = {"http_status": http, "code": payload.get("code"), "accepted": str(payload.get("code")) == "200", "engine": "legacy"}
             if not 200 <= http < 300 or not safe["accepted"]:
@@ -199,13 +284,20 @@ class ProxySetup:
     def current_proxy(self, db_id, proxy, wait_time=60):
         deadline = time.monotonic() + wait_time
         while True:
-            http, payload = self.api("GET", "cbs_proxy_get", db_id)
-            if http == 409 or str(payload.get("code")) == "409":
-                http, payload = self.api("GET", "proxy_get", db_id)
+            try:
+                http, payload, action = self.proxy_state(db_id, proxy)
+            except requests.RequestException:
+                http, payload, action = 0, {}, "control_proxy_get"
             data = payload.get("data")
-            if not 200 <= http < 300 or not isinstance(data, dict):
+            pending = action == "control_proxy_get" and (not 200 <= http < 300 or str(payload.get("code")) != "200"
+                                                        or not isinstance(data, dict) or "proxy_config" not in data)
+            if pending:
+                safe = {}
+                data = {}
+            elif not 200 <= http < 300 or not isinstance(data, dict):
                 raise ValueError("无法查询云机代理引擎")
-            safe = status_fields(payload)
+            else:
+                safe = status_fields(payload)
             # ROM 先就绪时，代理接口仍可能只返回 code=0 的主机元数据。
             # 必须读到实际代理配置（允许明确为空）或 CBS 启用状态，才可开始写入。
             if "proxy_config" in data or "enabled" in safe:
@@ -220,15 +312,20 @@ class ProxySetup:
             time.sleep(min(5, max(0, deadline - time.monotonic())))
 
     def cloud_json(self, db_id, url, timeout):
-        http, payload = self.api("POST", "shell", db_id, {"cmd": probe_command(url, timeout)}, timeout + 10)
+        # curl非零会被主机包装成业务失败；单独输出退出码，避免丢失网络错误。
+        command = probe_command(url, timeout) + " 2>/dev/null; curl_status=$?; printf '\\nCURL_EXIT=%s\\n' \"$curl_status\""
+        http, payload = self.api("POST", "shell", db_id, {"cmd": command}, timeout + 10)
         if not 200 <= http < 300 or str(payload.get("code")) != "200":
-            raise ValueError("云机探测命令执行失败")
+            raise ValueError(f"云机探测命令执行失败（HTTP {http}，业务码 {payload.get('code')}）：{url}")
         data = payload.get("data")
         output = data.get("message") if isinstance(data, dict) else None
-        if not isinstance(output, str):
-            raise ValueError("云机探测未返回执行结果")
+        marker = re.fullmatch(r"(.*)\r?\nCURL_EXIT=([0-9]+)\s*", output, re.S) if isinstance(output, str) else None
+        if marker is None:
+            raise ValueError("云机探测未返回有效退出码：" + url)
+        if int(marker[2]) != 0:
+            raise ValueError(f"云机探测请求失败（curl退出码 {marker[2]}）：{url}")
         try:
-            result = json.loads(output)
+            result = json.loads(marker[1])
         except ValueError:
             raise ValueError("云机探测未返回有效JSON") from None
         if not isinstance(result, dict):
@@ -249,12 +346,10 @@ class ProxySetup:
                 raise ValueError("云机网页命令执行结果未确认")
             data = {"output": result[1], "exit_code": int(result[2])}
         else:
-            response = self.session.post(f"{self.host}/android_api/v2/{db_id}/system/shell",
-                                         json={"command": command, "is_root": False}, timeout=(5, timeout + 10))
-            response.raise_for_status()
-            payload = response.json()
+            http, payload = self.control_api("POST", "system/shell", db_id,
+                                             {"command": command, "is_root": False}, timeout + 10)
             data = payload.get("data") if isinstance(payload, dict) else None
-            if not isinstance(payload, dict) or str(payload.get("code")) != "200" or not isinstance(data, dict):
+            if not 200 <= http < 300 or str(payload.get("code")) != "200" or not isinstance(data, dict):
                 raise ValueError("云机网页命令执行未确认")
         exit_code = data.get("exit_code")
         if type(exit_code) is not int:
@@ -275,14 +370,14 @@ class ProxySetup:
             raise ValueError("网页探测配置无效")
         for url in urls:
             probe_command(url, probe_config["timeout"])
-        last = {"verified": False, "scope": "proxy_exit_and_web" if urls else "proxy_exit_only", "tiktok_app_verified": False}
+        errors = []
         while True:
+            # 每次验证独立记账；出口失败时不能残留上一轮网页成功记录。
+            last = {"verified": False, "scope": "proxy_exit_and_web" if urls else "proxy_exit_only",
+                    "tiktok_app_verified": False, "web_checks": [], "completed_rounds": 0,
+                    "attempt_errors": errors}
             try:
-                http, payload = self.api("GET", "cbs_proxy_get", db_id)
-                action = "cbs_proxy_get"
-                if http == 409 or str(payload.get("code")) == "409":
-                    http, payload = self.api("GET", "proxy_get", db_id)
-                    action = "proxy_get"
+                http, payload, action = self.proxy_state(db_id, proxy)
                 if not 200 <= http < 300:
                     raise ValueError(f"代理状态查询失败（HTTP {http}）")
                 last["api"] = dict(status_fields(payload), http_status=http, action=action)
@@ -317,21 +412,23 @@ class ProxySetup:
                 return last
             except (requests.RequestException, ValueError, TypeError) as error:
                 last["error"] = str(error) if type(error) is ValueError else type(error).__name__
+                errors.append(last["error"])
             if time.monotonic() >= deadline:
                 return last
-            self.log("等待代理状态与云机出口验证")
+            self.log("等待代理状态与云机出口验证：" + last["error"])
             time.sleep(min(3, max(0, deadline - time.monotonic())))
 
     def update_mapping(self, db_id, proxy_id, verification, state):
-        mapping = read_json(self.mapping_path)
-        if mapping.get("host") != self.host or not isinstance(mapping.get("devices"), dict) or db_id not in mapping["devices"]:
-            raise ValueError("设备映射主机或目标不匹配，原映射已保留")
-        entry = mapping["devices"][db_id]
-        entry.update(proxy_id=proxy_id, proxy_exit_ip=verification["exit_ip"],
-                     proxy_verified_at=verification["verified_at"], state=state,
-                     last_seen=timestamp())
-        mapping["timestamp"] = timestamp()
-        save_json(self.mapping_path, mapping)
+        with MAPPING_LOCK:
+            mapping = read_json(self.mapping_path)
+            if mapping.get("host") != self.host or not isinstance(mapping.get("devices"), dict) or db_id not in mapping["devices"]:
+                raise ValueError("设备映射主机或目标不匹配，原映射已保留")
+            entry = mapping["devices"][db_id]
+            entry.update(proxy_id=proxy_id, proxy_exit_ip=verification["exit_ip"],
+                         proxy_verified_at=verification["verified_at"], state=state,
+                         last_seen=timestamp())
+            mapping["timestamp"] = timestamp()
+            save_json(self.mapping_path, mapping)
 
     def run(self, db_id, proxy, probe_config, start_stopped=False, keep_running=False,
             verify_only=False, wait_time=60, sync_system=False, restore_state=True):
@@ -355,7 +452,8 @@ class ProxySetup:
         self.log(f"目标云机: {db_id}，代理: {proxy['id']}")
         try:
             # 启动或设置前先查明目标、映射和代理，避免错设备或不可用资源。
-            mapping = read_json(self.mapping_path)
+            with MAPPING_LOCK:
+                mapping = read_json(self.mapping_path)
             if mapping.get("host") != self.host or not isinstance(mapping.get("devices"), dict) or not isinstance(mapping["devices"].get(db_id), dict):
                 raise ValueError("设备映射主机或目标不匹配")
             instance = self.device.list_instances().get(db_id)
@@ -379,8 +477,8 @@ class ProxySetup:
                 raise ValueError("云机未运行；配置时可指定--start-stopped，只读验证需先手动启动")
             if not self.device.wait_ready([db_id]):
                 raise ValueError("ROM未就绪，未配置代理")
+            self.wait_android_ready(db_id)
             system = SystemSetup(self) if sync_system else None
-            expected_region = system.resolve(db_id, proxy, local["exit_ip"]) if system else None
             if not verify_only:
                 current = self.current_proxy(db_id, proxy)
                 engine_type = requested_engine if requested_engine is not None else current["engineType"]
@@ -391,7 +489,8 @@ class ProxySetup:
                     report["set_api"] = {"action": "already_configured", "accepted": True}
                     self.log("已有代理配置匹配且出网正常，跳过写入")
                 else:
-                    self.log("配置目标云机代理（legacy兼容模式）" if engine_type in (0, 1) else "配置目标云机代理（CBS接口）")
+                    self.log("配置目标云机代理（独立控制端口）" if engine_type == 0 else
+                             "配置目标云机代理（legacy兼容模式）" if engine_type == 1 else "配置目标云机代理（CBS接口）")
                     try:
                         report["set_api"] = self.apply(db_id, body, proxy, engine_type)
                     except requests.RequestException as error:
@@ -402,9 +501,22 @@ class ProxySetup:
                 active = self.current_proxy(db_id, proxy)
                 if not active.get("matches") or active.get("enabled") is False or (requested_engine is not None and active["engineType"] != requested_engine):
                     raise ValueError("代理节点或引擎未确认，未继续地区同步")
+                # 国家全名回查需要云机联网，必须在代理绑定并确认后执行。
+                expected_region = system.resolve(db_id, proxy, local["exit_ip"])
                 report["system"] = {}
                 self.log("核验代理地区与系统参数" if verify_only else "同步国家、时区、语言和GPS；已确认的相同配置跳过写入")
                 system.configure(db_id, expected_region, report["system"], verify_only, mapping["devices"][db_id].get("system_config"))
+                if not verify_only and report["system"].get("reboot_verified"):
+                    active = self.current_proxy(db_id, proxy)
+                    report["proxy_after_reboot"] = active
+                    if (not active.get("matches") or active.get("enabled") is False
+                            or active["engineType"] != engine_type):
+                        self.log("重启后代理未保留，恢复已确认重启的目标云机代理")
+                        try:
+                            report["reapply_api"] = self.apply(db_id, body, proxy, engine_type)
+                        except requests.RequestException as error:
+                            report["reapply_api"] = {"accepted": None, "error": type(error).__name__}
+                            self.log("重启后代理恢复响应不明确，回查配置与出口；未重发")
             report["verification"] = self.verify(db_id, local["exit_ip"], probe_config, wait_time, proxy)
             actual_engine = report["verification"].get("api", {}).get("engineType")
             if actual_engine in (0, 1, 2):
@@ -442,11 +554,13 @@ class ProxySetup:
                     report["mapping_updated"] = True
                 # 地区已完成的事实不依赖网页验证；避免网络波动导致下次重复设置和重启。
                 if report.get("system", {}).get("success") and not verify_only:
-                    latest = read_json(self.mapping_path)
-                    latest["devices"][db_id]["system_config"] = {
-                        "expected": expected_region, "country_api_confirmed": report["system"].get("country_api_confirmed") is True,
-                        "verified_at": timestamp()}
-                    save_json(self.mapping_path, latest)
+                    with MAPPING_LOCK:
+                        latest = read_json(self.mapping_path)
+                        latest["devices"][db_id]["system_config"] = {
+                            "expected": expected_region, "country_api_confirmed": report["system"].get("country_api_confirmed") is True,
+                            "gps_persisted": report["system"].get("gps_persisted") is True,
+                            "verified_at": timestamp()}
+                        save_json(self.mapping_path, latest)
                     report["system_mapping_updated"] = True
             except (requests.RequestException, OSError, ValueError, KeyError, TypeError) as error:
                 report.update(success=False, error="最终状态或映射更新失败: " + type(error).__name__)

@@ -2,6 +2,7 @@
 import argparse
 import json
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,8 @@ from permission_manager import PermissionManager
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# ponytail: 当前单主机，进程内串行上传和安装确认；多主机时再按主机分锁。
+INSTALL_LOCK = threading.Lock()
 
 
 def parse_instances(payload):
@@ -95,27 +98,39 @@ class TikTokInstaller:
             self.log(f"等待ROM就绪: {len(db_ids) - len(remaining)}/{len(db_ids)}")
             time.sleep(min(5, max(0, deadline - time.monotonic())))
 
-    def restore_stopped(self, db_ids):
+    def restore_stopped(self, db_ids, timeout=180):
         if not db_ids:
             return {"success": True, "devices": []}
         self.log("恢复原停机状态: " + ", ".join(db_ids))
-        try:
-            current = self.list_instances()
-            pending = [db_id for db_id in db_ids if current.get(db_id, {}).get("state") != "stopped"]
-            if pending:
-                response = self.post_action("stop", pending)
-                if str(response.get("code")) != "200":
-                    return {"success": False, "devices": pending, "response": response}
-                deadline = time.monotonic() + 60
-                while time.monotonic() < deadline:
-                    current = self.list_instances()
-                    pending = [db_id for db_id in pending if current.get(db_id, {}).get("state") != "stopped"]
-                    if not pending:
-                        break
-                    time.sleep(3)
-            return {"success": not pending, "devices": db_ids, "unconfirmed": pending}
-        except (requests.RequestException, ValueError) as error:
-            return {"success": False, "devices": db_ids, "error": str(error)}
+        report = {"success": False, "devices": db_ids, "unconfirmed": list(db_ids),
+                  "stop_requested": False}
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                current = self.list_instances()
+                states = {db_id: current.get(db_id, {}).get("state", "unknown") for db_id in db_ids}
+                pending = [db_id for db_id in db_ids if states[db_id] != "stopped"]
+                report.update(states=states, unconfirmed=pending)
+                if not pending:
+                    report["success"] = True
+                    return report
+                # starting/rebooting期间先只读等待，避免停机请求与启动任务冲突。
+                if not report["stop_requested"] and all(states[db_id] == "running" for db_id in pending):
+                    report["stop_requested"] = True
+                    try:
+                        response = self.post_action("stop", pending)
+                        report["response_code"] = response.get("code")
+                    except (requests.RequestException, ValueError) as error:
+                        report["response_uncertain"] = True
+                        report["last_error"] = type(error).__name__
+                    # 受理或返回不明确都只回查；不能重复发送停机请求。
+            except (requests.RequestException, ValueError) as error:
+                report["last_error"] = type(error).__name__
+            if time.monotonic() >= deadline:
+                report["error"] = "恢复停机超时；最后状态：" + str(report.get("states", {}))
+                return report
+            self.log("等待停机确认" if report["stop_requested"] else "等待启动或重启结束后停机")
+            time.sleep(min(3, max(0, deadline - time.monotonic())))
 
     def install_from_local(self, apk_path, db_ids, wait_time=300, verify=True, **options):
         apk = Path(apk_path).resolve()
@@ -191,17 +206,27 @@ class TikTokInstaller:
                     else:
                         upload.append(db_id)
                 if upload:
-                    self.log(f"上传安装包到 {len(upload)} 台，等待接口返回；不重发安装请求")
-                    response = self.uploader.upload_local(source, upload) if mode == "local" else self.uploader.install_from_url(source, upload)
-                    record["upload_response"] = response
-                    self.log("安装请求已返回，回查实际包名")
-                    # 请求失败/超时也回查所有目标，避免服务端已安装却被判失败。
-                    verified = self.verifier.wait_for_install(upload, wait_time, self.package_name, self.log) if verify else {"success": [], "unconfirmed": upload}
-                    record["verification"] = verified
-                    for db_id in verified["success"]:
-                        result["devices"][db_id].update(status="installed", package_verified=True)
-                    for db_id in verified["unconfirmed"]:
-                        result["devices"][db_id].update(status="unconfirmed", error="安装尚未确认；请先使用--verify-only回查，未重发上传")
+                    self.log("等待主机安装队列；上传至安装确认逐批执行")
+                    with INSTALL_LOCK:
+                        self.log(f"上传安装包到 {len(upload)} 台，等待接口返回；不重发安装请求")
+                        response = self.uploader.upload_local(source, upload) if mode == "local" else self.uploader.install_from_url(source, upload)
+                        record["upload_response"] = response
+                        busy = (response.get("http_status") == 200 and str(response.get("code")) == "201"
+                                and response.get("msg") == "当前有安装任务进行中，请稍后再试")
+                        if busy:
+                            record["rejected_busy"] = True
+                            self.log("主机安装队列忙，本次请求被拒绝（业务码201）；只回查一次，未重发上传")
+                        else:
+                            self.log("安装请求已返回，回查实际包名")
+                        # 超时仍等待实际安装结果；明确忙拒绝未接受任务，只回查一次。
+                        verified = self.verifier.wait_for_install(upload, 0 if busy else wait_time, self.package_name, self.log) if verify else {"success": [], "unconfirmed": upload}
+                        record["verification"] = verified
+                        for db_id in verified["success"]:
+                            result["devices"][db_id].update(status="installed", package_verified=True)
+                        for db_id in verified["unconfirmed"]:
+                            error = ("主机安装队列忙，本次请求被拒绝（业务码201），未重发上传" if busy else
+                                     "安装尚未确认；请先使用--verify-only回查，未重发上传")
+                            result["devices"][db_id].update(status="unconfirmed", error=error)
                 if overlay:
                     installed = [db_id for db_id in batch if result["devices"][db_id]["status"] in ("installed", "already_installed")]
                     record["permissions"] = self.permission_mgr.batch_grant_permissions(installed)

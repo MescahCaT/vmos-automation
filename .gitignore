@@ -39,6 +39,7 @@ dist/
 *.old
 *~
 /analysis.txt
+/剩余云机-*.json
 
 # Generated device, proxy, system and installation results
 /阶段2-云机批量创建与初始化/*.json
