@@ -3,7 +3,9 @@
     {
       "email": "account@example.com",
       "username": "account_example",
+      "device_name": "157.1",
       "login_mode": "email_code",
+      "password_env": "TK_PASSWORD_157_1",
       "enabled": true,
       "note": "替换为自己的账号；密码通过环境变量提供。"
     }

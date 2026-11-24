@@ -53,13 +53,38 @@ class LoginTests(unittest.TestCase):
             flow.navigate_to_email()
         flow.ui.call.assert_not_called()
 
+    def test_login_method_entry_is_retried_only_while_same_button_remains(self):
+        flow = TikTokLogin(CONFIG)
+        flow.ui = Mock()
+        choice = tree({"content-desc": "Use phone / email / username", "class": "android.widget.Button",
+                       "clickable": "true", "bounds": "[79,1150][1001,1276]"})
+        email_page = tree("Email / Username", {"class": "android.widget.EditText", "text": "Email or username"})
+        flow.read_page = Mock(side_effect=[choice, choice, email_page])
+        with patch("auto_login.time.sleep"):
+            result, evidence = flow.navigate_to_email()
+        self.assertIs(result, email_page)
+        self.assertIsNone(evidence)
+        self.assertEqual(flow.ui.click.call_count, 2)
+
+    def test_login_method_entry_stops_after_five_confirmed_noop_clicks(self):
+        flow = TikTokLogin(CONFIG)
+        flow.ui = Mock()
+        choice = tree({"content-desc": "Use phone / email / username", "class": "android.widget.Button",
+                       "clickable": "true", "bounds": "[79,1150][1001,1276]"})
+        flow.read_page = Mock(return_value=choice)
+        with patch("auto_login.time.sleep"):
+            with self.assertRaises(PendingLogin) as raised:
+                flow.navigate_to_email()
+        self.assertEqual(raised.exception.status, "unknown_page")
+        self.assertEqual(flow.ui.click.call_count, 5)
+
     def test_dump_retries_only_read_only_transient_ui_results(self):
         ui = ControlAPI("http://host", DB)
         ui.call = Mock(side_effect=[None, "", ET.tostring(PROFILE, encoding="unicode")])
         with patch("control_api.time.sleep"):
             self.assertEqual(profile_evidence(ui.dump()), profile_evidence(PROFILE))
         self.assertTrue(all(c.args == ("accessibility/dump",) for c in ui.call.call_args_list))
-        ui.call.side_effect = [None, None, None]
+        ui.call.side_effect = [None] * 5
         with patch("control_api.time.sleep"):
             with self.assertRaises(ValueError):
                 ui.dump()
@@ -91,7 +116,7 @@ class LoginTests(unittest.TestCase):
         self.assertEqual(ui.dump.call_count, 2)
         ui.call.assert_called_once()
         ui.dump = Mock(return_value=pending)
-        with patch("control_api.time.monotonic", side_effect=[0, 4]):
+        with patch("control_api.time.monotonic", side_effect=[0, 16]):
             with self.assertRaises(ValueError) as raised:
                 ui.fill(target, EMAIL)
         self.assertNotIn(EMAIL, str(raised.exception))
@@ -105,7 +130,7 @@ class LoginTests(unittest.TestCase):
         ui.fill(target, secret)
         ui.call.assert_called_once()
         ui.dump.return_value = tree({"class": "android.widget.EditText", "password": "true", "text": "x" * len(secret)})
-        with patch("control_api.time.monotonic", side_effect=[0, 4]):
+        with patch("control_api.time.monotonic", side_effect=[0, 16]):
             with self.assertRaises(ValueError) as raised:
                 ui.fill(target, secret)
         self.assertNotIn(secret, str(raised.exception))
@@ -149,6 +174,20 @@ class LoginTests(unittest.TestCase):
         mail.fetch.side_effect = [OLD, None, ValueError("unavailable"), NEW]
         with patch("email_verifier.time.sleep"):
             self.assertEqual(mail.wait_new(OLD, timeout=10, interval=0), NEW)
+
+    def test_mail_wait_distinguishes_missing_and_unchanged_codes_without_exposing_values(self):
+        mail = EmailVerifier(CONFIG["tiktok"]["email_code"], EMAIL)
+        for code, reason in ((None, "未返回可识别的六位验证码"), (OLD, "仍返回发码前已有验证码")):
+            with self.subTest(code_present=code is not None):
+                mail.fetch = Mock(return_value=code)
+                logs = []
+                with self.assertRaises(ValueError) as raised:
+                    mail.wait_new(OLD, timeout=0, log=logs.append)
+                self.assertIn(reason, str(raised.exception))
+                self.assertIn(reason, logs[0])
+                self.assertNotIn(OLD, str(raised.exception))
+                self.assertNotIn(OLD, " ".join(logs))
+                mail.fetch.assert_called_once_with()
 
     def test_profile_evidence_rejects_homepage_and_other_profiles(self):
         self.assertEqual(profile_evidence(PROFILE), {"own_profile": True, "username": "@test.user"})
@@ -206,11 +245,14 @@ class LoginTests(unittest.TestCase):
         return login
 
     def execute(self, login, **options):
+        ui_tree = options.pop("ui_tree", PROFILE)
         with (patch("auto_login.ROOT", login.output_dir), patch("auto_login.ControlAPI") as control,
-              patch("auto_login.EmailVerifier") as mail, patch("auto_login.check_proxy", return_value={"exit_ip": IP}),
+              patch("auto_login.EmailVerifier") as mail,
+              patch("setup_proxy.check_proxy", side_effect=AssertionError("登录不应探测代理")),
               patch("auto_login.time.sleep"), contextlib.redirect_stdout(io.StringIO())):
-            control.return_value.dump.return_value = PROFILE
+            control.return_value.dump.return_value = ui_tree
             mail.return_value.wait_new.return_value = NEW
+            options.setdefault("expected_username", "test.user")
             result = login.run(DB, EMAIL, **options)
             return result, control, mail
 
@@ -219,6 +261,9 @@ class LoginTests(unittest.TestCase):
             login = self.make_login(temp)
             report, control, mail = self.execute(login)
             self.assertTrue(report["success"])
+            login.proxy.verify.assert_not_called()
+            self.assertTrue(report["proxy"]["skipped"])
+            self.assertFalse(report["proxy"]["verified"])
             mail.return_value.wait_new.assert_called_once_with(OLD, 120, log=login.log)
             login.input_code.assert_called_once_with(NEW, CODE_PAGE)
             mapping = json.loads(login.mapping_path.read_text(encoding="utf-8"))
@@ -229,15 +274,15 @@ class LoginTests(unittest.TestCase):
             self.assertNotIn(NEW, report_text)
             self.assertNotIn(OLD, report_text)
 
-    def test_proxy_failure_never_launches_or_sends_and_restores_original_stop(self):
+    def test_proxy_probe_failure_is_skipped_and_login_restores_original_stop(self):
         with tempfile.TemporaryDirectory() as temp:
             login = self.make_login(temp, "stopped")
-            login.proxy.verify.return_value = {"verified": False}
+            login.proxy.verify.side_effect = AssertionError("不应检测云机代理或网页")
             report, control, mail = self.execute(login, start_stopped=True)
-            self.assertFalse(report["success"])
-            self.assertEqual(report["status"], "proxy_unavailable")
-            control.return_value.call.assert_not_called()
-            login.send_code.assert_not_called()
+            self.assertTrue(report["success"])
+            self.assertEqual(report["status"], "logged_in")
+            login.proxy.verify.assert_not_called()
+            login.send_code.assert_called_once()
             login.device.post_action.assert_called_once_with("run", [DB])
             login.device.restore_stopped.assert_called_once_with([DB])
 
@@ -284,7 +329,7 @@ class LoginTests(unittest.TestCase):
                 TikTokLogin.input_code(login, NEW, CODE_PAGE)
             login.ui.text.assert_not_called()
 
-    def test_password_run_routes_to_password_flow_and_region_failure_blocks_account_submission(self):
+    def test_password_run_routes_to_password_flow_and_region_mismatch_does_not_block_login(self):
         with tempfile.TemporaryDirectory() as temp:
             login = self.make_login(temp)
             login.login_with_password = Mock()
@@ -296,13 +341,15 @@ class LoginTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             login = self.make_login(temp)
             (Path(temp) / "proxy.json").write_text(json.dumps({"proxies": [{"id": "p1", "region": {"country": "US"}}]}), encoding="utf-8")
-            with patch("auto_login.SystemSetup") as system:
-                system.return_value.resolve.side_effect = ValueError("region mismatch")
+            with patch("setup_system.SystemSetup", side_effect=AssertionError("不应检测地区或GPS")) as system:
                 report, control, _ = self.execute(login)
-            self.assertFalse(report["success"])
-            self.assertEqual(report["status"], "system_unavailable")
-            control.return_value.call.assert_not_called()
-            login.enter_email.assert_not_called()
+            self.assertTrue(report["success"])
+            self.assertEqual(report["status"], "logged_in")
+            system.assert_not_called()
+            login.enter_email.assert_called_once()
+            self.assertTrue(report["system"]["skipped"])
+            self.assertFalse(report["system"]["verification_requested"])
+            self.assertFalse(report["system"]["success"])
 
     def test_password_flow_uses_matching_email_once_and_verifies_own_profile(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -411,6 +458,7 @@ class LoginTests(unittest.TestCase):
         for code_page in (CODE_PAGE, verify_email, verify_identity):
             with self.subTest(page=code_page[0].get("text")), tempfile.TemporaryDirectory() as temp:
                 login = self.make_login(temp)
+                login.completion = "password-transition"
                 login.ui = Mock()
                 login.report = {}
                 mail = Mock()

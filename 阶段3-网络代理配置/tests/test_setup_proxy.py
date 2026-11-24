@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from setup_proxy import ProxySetup, legacy_proxy_body, probe_command, proxy_body, proxy_matches, status_fields
+from setup_proxy import ProxySetup, ProxyStopUnconfirmed, legacy_proxy_body, probe_command, proxy_body, proxy_matches, status_fields
 from relay_proxy import relay_node
 
 DB = "EDGE123456"
@@ -29,6 +29,51 @@ CHAIN = dict(PROXY, transit={"protocol": "vless", "host": "192.0.2.1", "port": 4
 
 
 class ProxyTests(unittest.TestCase):
+    def test_submission_only_sends_each_engine_request_once_without_stop_or_configuration_readbacks(self):
+        for engine in (0, 1, 2):
+            with self.subTest(engine=engine):
+                setup = ProxySetup(HOST)
+                setup.log = Mock()
+                setup.control_api = Mock(side_effect=[requests.ReadTimeout(), (200, {"code": 0})])
+                setup.api = Mock(side_effect=[requests.ReadTimeout(), (200, {"code": 0})])
+                setup.stop_proxy = Mock(side_effect=AssertionError("stop readback"))
+                setup.current_proxy = Mock(side_effect=AssertionError("proxy readback"))
+                result = setup.apply(DB, proxy_body(PROXY), PROXY, engine, verify_result=False)
+                self.assertTrue(result["attempted"])
+                self.assertFalse(result["accepted"])
+                self.assertFalse(result["verification_requested"])
+                calls = setup.control_api.call_args_list if engine == 0 else setup.api.call_args_list
+                self.assertEqual([c.args[1] for c in calls],
+                                 ["proxy/set_enabled", "proxy/set_enabled"] if engine == 0 else
+                                 ["proxy_stop", "proxy_set"] if engine == 1 else ["cbs_proxy_set"])
+                setup.stop_proxy.assert_not_called()
+                setup.current_proxy.assert_not_called()
+                self.assertNotIn("private-pass", json.dumps(result))
+
+    def test_stop_timeout_confirms_on_fifth_read_and_never_resends_stop(self):
+        setup = ProxySetup(HOST)
+        setup.log = Mock()
+        setup.control_api = Mock(side_effect=[requests.ReadTimeout()] +
+            [(200, {"code": 200, "data": {"enabled": True}})] * 4 +
+            [(200, {"code": 200, "data": {"enabled": False}})])
+        with patch("setup_proxy.time.sleep"):
+            setup.stop_proxy(DB, standard=True)
+        methods = [c.args[0] for c in setup.control_api.call_args_list]
+        self.assertEqual(methods, ["POST"] + ["GET"] * 5)
+
+    def test_unconfirmed_stop_blocks_region_writes_and_keeps_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            setup = self.make_setup(temp)
+            setup.apply.side_effect = ProxyStopUnconfirmed("旧代理停止未确认")
+            proxy = dict(PROXY, region={"country": "US", "language": "en", "timezone": "America/Los_Angeles"})
+            with patch("setup_proxy.SystemSetup") as system, patch("setup_proxy.check_proxy", return_value={"exit_ip": IP}):
+                result = setup.run(DB, proxy, CONFIG, sync_system=True)
+            self.assertFalse(result["success"])
+            self.assertIn("旧代理停止未确认", result["error"])
+            system.return_value.resolve.assert_not_called()
+            system.return_value.configure.assert_not_called()
+            setup.verify.assert_not_called()
+
     def test_standard_proxies_use_distinct_ports_even_with_same_recorded_ip(self):
         instances = {DB: {"http_api_port": 35000, "ip": "172.17.0.2"},
                      OTHER: {"http_api_port": 35001, "ip": "172.17.0.2"}}
@@ -76,34 +121,37 @@ class ProxyTests(unittest.TestCase):
                     setup.control_api("GET", "proxy/get", DB)
                 setup.session.request.assert_not_called()
 
-    def test_standard_stop_requires_explicit_disabled_state_and_never_retries_timeout(self):
+    def test_standard_stop_requires_explicit_disabled_state_and_never_retries_write(self):
         for code in (0, 200):
             setup = ProxySetup(HOST)
-            setup.control_api = Mock(side_effect=[
-                (200, {"code": code, "data": {"enabled": True}}),
-                (200, {"code": 200, "data": {"enabled": True}})])
-            with self.assertRaisesRegex(ValueError, "旧代理停止未确认"):
+            setup.control_api = Mock(side_effect=[(200, {"code": code, "data": {"enabled": True}})]
+                                     + [(200, {"code": 200, "data": {"enabled": True}})] * 5)
+            with patch("setup_proxy.time.sleep"), self.assertRaisesRegex(ValueError, "旧代理停止未确认"):
                 setup.apply(DB, proxy_body(CHAIN), CHAIN, 0)
-            self.assertEqual([call.args[0] for call in setup.control_api.call_args_list], ["POST", "GET"])
+            self.assertEqual([c.args[0] for c in setup.control_api.call_args_list].count("POST"), 1)
+            self.assertEqual([c.args[0] for c in setup.control_api.call_args_list].count("GET"), 5)
         setup.control_api = Mock(side_effect=[
             (200, {"code": 0}), (200, {"code": 200, "data": {"enabled": False}}),
             (200, {"code": 200})])
         self.assertTrue(setup.apply(DB, proxy_body(CHAIN), CHAIN, 0)["accepted"])
-        setup.control_api = Mock(side_effect=requests.Timeout())
-        with self.assertRaises(requests.Timeout):
+        setup.control_api = Mock(side_effect=[requests.Timeout()] +
+            [(200, {"code": 200, "data": {"enabled": True}})] * 5)
+        with patch("setup_proxy.time.sleep"), self.assertRaisesRegex(ValueError, "旧代理停止未确认"):
             setup.apply(DB, proxy_body(CHAIN), CHAIN, 0)
-        self.assertEqual([c.args[0] for c in setup.control_api.call_args_list], ["POST", "GET"])
+        self.assertEqual([c.args[0] for c in setup.control_api.call_args_list].count("POST"), 1)
+        self.assertEqual([c.args[0] for c in setup.control_api.call_args_list].count("GET"), 5)
         for disabled in (True, False):
-            setup.control_api = Mock(side_effect=[requests.Timeout(),
-                (200, {"code": 200, "data": {"enabled": not disabled}}), (200, {"code": 200})])
+            setup.control_api = Mock(side_effect=[requests.Timeout()] +
+                [(200, {"code": 200, "data": {"enabled": not disabled}})] * (5 if not disabled else 1)
+                + ([(200, {"code": 200})] if disabled else []))
             if disabled:
-                self.assertTrue(setup.apply(DB, proxy_body(CHAIN), CHAIN, 0)["accepted"])
-                self.assertEqual([c.args[3]["enabled"] for c in setup.control_api.call_args_list if c.args[0] == "POST"],
-                                 [False, True])
+                with patch("setup_proxy.time.sleep"):
+                    self.assertTrue(setup.apply(DB, proxy_body(CHAIN), CHAIN, 0)["accepted"])
+                self.assertEqual([c.args[3]["enabled"] for c in setup.control_api.call_args_list if c.args[0] == "POST"], [False, True])
             else:
-                with self.assertRaisesRegex(ValueError, "旧代理停止未确认"):
+                with patch("setup_proxy.time.sleep"), self.assertRaises(ValueError):
                     setup.apply(DB, proxy_body(CHAIN), CHAIN, 0)
-                self.assertEqual(setup.control_api.call_count, 2)
+                self.assertEqual([c.args[0] for c in setup.control_api.call_args_list].count("POST"), 1)
 
     def test_android_boot_requires_command_result_and_blocks_proxy_writes(self):
         setup = ProxySetup(HOST)
@@ -322,10 +370,11 @@ class ProxyTests(unittest.TestCase):
         for response in cases:
             with self.subTest(response=response):
                 setup = ProxySetup(HOST)
-                setup.api = Mock(side_effect=[(500, {"code": 500}), response])
-                with self.assertRaises(ValueError):
+                setup.api = Mock(side_effect=[(500, {"code": 500})] + [response] * 5)
+                with patch("setup_proxy.time.sleep"), self.assertRaises(ValueError):
                     setup.apply(DB, proxy_body(PROXY), PROXY, engine_type=1)
-                self.assertEqual([call.args[1] for call in setup.api.call_args_list], ["proxy_stop", "proxy_get"])
+                self.assertEqual([call.args[1] for call in setup.api.call_args_list].count("proxy_stop"), 1)
+                self.assertEqual([call.args[1] for call in setup.api.call_args_list].count("proxy_get"), 5)
 
     def test_proxy_service_waits_past_rom_metadata_before_any_write(self):
         setup = ProxySetup(HOST)
@@ -338,7 +387,8 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual(setup.current_proxy(DB, CHAIN), {"code": 200, "engineType": 0, "enabled": False, "matches": False})
         self.assertEqual([call.args[:2] for call in setup.control_api.call_args_list], [("GET", "proxy/get")] * 2)
         setup.api.assert_not_called()
-        setup.log.assert_called_once_with("等待云机代理服务就绪")
+        self.assertTrue(any("第1/20轮未确认" in call.args[0] for call in setup.log.call_args_list))
+        self.assertEqual(len(setup.log.call_args_list), 2)
         setup.control_api = Mock(return_value=pending)
         with self.assertRaisesRegex(ValueError, "代理服务尚未就绪"):
             setup.current_proxy(DB, CHAIN, wait_time=0)
@@ -376,6 +426,131 @@ class ProxyTests(unittest.TestCase):
         self.assertFalse(sent["dnsOverProxyDisabled"])
         self.assertEqual(sent["nodes"][0]["proxyName"], "vless")
         setup.api.assert_not_called()
+
+    def test_configuration_mode_confirms_enabled_nodes_without_network_or_health_tests(self):
+        with tempfile.TemporaryDirectory() as temp:
+            setup = self.make_setup(temp)
+            active = {"engineType": 0, "enabled": True, "healthy": False, "matches": True}
+            setup.current_proxy.return_value = active
+            setup.verify.side_effect = AssertionError("network verification requested")
+            setup.cloud_json.side_effect = AssertionError("cloud network request")
+            setup.cloud_http = Mock(side_effect=AssertionError("web request"))
+            with patch("setup_proxy.check_proxy", side_effect=AssertionError("local network probe")) as probe:
+                result = setup.run(DB, CHAIN, {}, check_network=False)
+            self.assertTrue(result["success"])
+            self.assertTrue(result["proxy_configured"])
+            self.assertFalse(result["network_check_requested"])
+            self.assertEqual(result["verification"]["scope"], "proxy_configuration")
+            self.assertNotIn("exit_ip", result["verification"])
+            self.assertEqual(result["set_api"]["action"], "already_configured")
+            setup.apply.assert_not_called()
+            probe.assert_not_called()
+            setup.verify.assert_not_called()
+            setup.cloud_json.assert_not_called()
+            setup.cloud_http.assert_not_called()
+            saved = json.loads(setup.mapping_path.read_text(encoding="utf-8"))["devices"][DB]
+            self.assertEqual(saved["proxy_id"], CHAIN["id"])
+            self.assertIn("proxy_configured_at", saved)
+            self.assertNotIn("proxy_verified_at", saved)
+            self.assertNotIn("proxy_exit_ip", saved)
+
+    def test_uncertain_proxy_write_is_confirmed_by_configuration_without_resending(self):
+        with tempfile.TemporaryDirectory() as temp:
+            setup = self.make_setup(temp)
+            setup.current_proxy.side_effect = [{"engineType": 0, "enabled": False, "matches": False},
+                                               {"engineType": 0, "enabled": True, "matches": True}]
+            setup.apply.side_effect = requests.ReadTimeout()
+            with patch("setup_proxy.check_proxy") as probe:
+                result = setup.run(DB, CHAIN, {}, check_network=False)
+            self.assertTrue(result["success"])
+            self.assertTrue(result["proxy_configured"])
+            self.assertIsNone(result["set_api"]["accepted"])
+            setup.apply.assert_called_once()
+            probe.assert_not_called()
+            setup.verify.assert_not_called()
+
+    def test_configuration_mode_requires_matching_state_and_polls_at_most_five(self):
+        active = {"engineType": 0, "enabled": True, "matches": True}
+        for change in ({"matches": False}, {"enabled": False}, {"engineType": 2}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temp:
+                setup = self.make_setup(temp)
+                pending = dict(active, **change)
+                for becomes_ready in (True, False):
+                    setup.current_proxy = Mock(side_effect=[pending] * (4 if becomes_ready else 5)
+                                               + ([active] if becomes_ready else []))
+                    with patch("setup_proxy.time.sleep"):
+                        if becomes_ready:
+                            self.assertTrue(setup.verify_configuration(DB, CHAIN, 0)["verified"])
+                        else:
+                            with self.assertRaisesRegex(ValueError, "5/5轮"):
+                                setup.verify_configuration(DB, CHAIN, 0)
+                    self.assertEqual(setup.current_proxy.call_count, 5)
+                setup.verify.assert_not_called()
+                setup.cloud_json.assert_not_called()
+
+    def test_configuration_mode_orders_proxy_region_and_rechecks_after_reboot(self):
+        region = {"country": "US", "language": "en", "timezone": "America/Los_Angeles",
+                  "latitude": 34.0522, "longitude": -118.2437}
+        for recovered in (True, False):
+            with self.subTest(recovered=recovered), tempfile.TemporaryDirectory() as temp:
+                setup = self.make_setup(temp)
+                active = {"engineType": 0, "enabled": True, "matches": True}
+                missing = {"engineType": 0, "enabled": False, "matches": False}
+                setup.current_proxy.side_effect = [missing, active, missing, active if recovered else missing]
+                setup.apply.side_effect = [{"accepted": True}, requests.ReadTimeout()]
+                with patch("setup_proxy.SystemSetup") as system, patch("setup_proxy.check_proxy") as probe:
+                    def configure(db, expected, report, *args):
+                        self.assertEqual(setup.apply.call_count, 1)
+                        self.assertEqual(setup.current_proxy.call_count, 2)
+                        self.assertEqual(expected, region)
+                        report.update(success=True, country_api_confirmed=True, gps_persisted=True, reboot_verified=True)
+                    system.return_value.configure.side_effect = configure
+                    result = setup.run(DB, dict(CHAIN, region=region), {}, wait_time=0,
+                                       sync_system=True, check_network=False)
+                self.assertEqual(result["success"], recovered)
+                self.assertEqual(result["proxy_configured"], recovered)
+                self.assertEqual(setup.apply.call_count, 2)
+                self.assertTrue(result["system"]["success"])
+                probe.assert_not_called()
+                system.return_value.resolve.assert_not_called()
+                setup.verify.assert_not_called()
+                setup.cloud_json.assert_not_called()
+
+    def test_configuration_mode_missing_gps_uses_exit_only_for_coordinate_source(self):
+        region = {"country": "US", "language": "en", "timezone": "America/Los_Angeles"}
+        with tempfile.TemporaryDirectory() as temp:
+            setup = self.make_setup(temp)
+            setup.current_proxy.return_value = {"engineType": 0, "enabled": True, "matches": True}
+            with patch("setup_proxy.SystemSetup") as system, patch("setup_proxy.check_proxy", return_value={"exit_ip": IP}) as probe:
+                expected = dict(region, latitude=34.0522, longitude=-118.2437)
+                system.return_value.resolve.return_value = expected
+                system.return_value.configure.side_effect = lambda db, target, report, *args: report.update(success=True)
+                result = setup.run(DB, dict(CHAIN, region=region), CONFIG, sync_system=True, check_network=False)
+            self.assertTrue(result["success"])
+            self.assertFalse(result["network_check_requested"])
+            self.assertEqual(result["gps_source"], {"exit_ip": IP, "purpose": "region_location"})
+            probe.assert_called_once()
+            system.return_value.resolve.assert_called_once_with(DB, dict(CHAIN, region=region), IP)
+            setup.verify.assert_not_called()
+            setup.cloud_json.assert_not_called()
+
+    def test_android_and_proxy_service_startup_allow_twentieth_read(self):
+        setup = ProxySetup(HOST)
+        setup.log = Mock()
+        setup.api = Mock(side_effect=[(200, {"code": 200, "data": {"message": "0"}})] * 19
+                         + [(200, {"code": 200, "data": {"message": "1"}})])
+        with patch("setup_proxy.time.sleep"):
+            setup.wait_android_ready(DB)
+        self.assertEqual(setup.api.call_count, 20)
+        setup.api = Mock(return_value=(200, {"code": 200, "data": {"message": "0"}}))
+        with patch("setup_proxy.time.sleep"), self.assertRaisesRegex(ValueError, "20/20轮.*300秒"):
+            setup.wait_android_ready(DB)
+        self.assertEqual(setup.api.call_count, 20)
+        setup.control_api = Mock(side_effect=[(404, {"code": 404})] * 19
+                                 + [(200, {"code": 200, "data": {"enabled": False}})])
+        with patch("setup_proxy.time.sleep"):
+            self.assertFalse(setup.current_proxy(DB, CHAIN)["enabled"])
+        self.assertEqual(setup.control_api.call_count, 20)
 
     def test_region_sync_runs_after_binding_and_records_only_verified_target(self):
         region = {"country": "US", "language": "en", "timezone": "America/Los_Angeles"}
@@ -507,6 +682,38 @@ class ProxyTests(unittest.TestCase):
         self.assertTrue(setup.verify(DB, IP, CONFIG, 0)["verified"])
         self.assertEqual(setup.api.call_args.args[1], "proxy_get")
 
+    def test_verify_can_retry_without_round_limit_until_confirmed(self):
+        setup = ProxySetup(HOST)
+        setup.log = Mock()
+        setup.proxy_state = Mock(side_effect=[ValueError("transient timeout")] * 65 + [
+            (200, {"code": 200, "data": {"enabled": True}}, "proxy_get")
+        ])
+        setup.cloud_json = Mock(return_value={"ip": IP})
+        elapsed = [0]
+        def sleep(seconds):
+            elapsed[0] += seconds
+        with patch("setup_proxy.time.sleep", side_effect=sleep), patch(
+                "setup_proxy.time.monotonic", side_effect=lambda: elapsed[0]):
+            result = setup.verify(DB, IP, dict(CONFIG, probe_urls=[]), None, unlimited_attempts=True)
+        self.assertTrue(result["verified"])
+        self.assertEqual(setup.proxy_state.call_count, 66)
+        self.assertEqual(elapsed[0], 130)
+        self.assertEqual(result["attempt_error_count"], 65)
+        self.assertEqual(len(result["attempt_errors"]), 20)
+
+    def test_unlimited_verify_stops_immediately_on_exit_ip_mismatch(self):
+        setup = ProxySetup(HOST)
+        setup.log = Mock()
+        setup.proxy_state = Mock(return_value=(200, {"code": 200, "data": {"enabled": True}}, "proxy_get"))
+        setup.cloud_json = Mock(return_value={"ip": "198.51.100.99"})
+        with patch("setup_proxy.time.sleep") as sleep:
+            result = setup.verify(DB, IP, dict(CONFIG, probe_urls=[]), None, unlimited_attempts=True)
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["attempt_error_count"], 1)
+        self.assertIn("出口与指定代理", result["error"])
+        setup.proxy_state.assert_called_once()
+        sleep.assert_not_called()
+
     def test_shell_output_is_required_not_merely_command_accepted(self):
         setup = ProxySetup(HOST)
         setup.api = Mock(return_value=(200, {"code": 200, "data": {"message": json.dumps({"ip": IP}) + "\nCURL_EXIT=0\n"}}))
@@ -530,17 +737,18 @@ class ProxyTests(unittest.TestCase):
         setup = ProxySetup(HOST)
         setup.log = Mock()
         setup.api = Mock(return_value=(200, {"code": 200, "data": {"enabled": True}}))
-        setup.cloud_json = Mock(side_effect=[{"ip": IP}, ValueError("exit probe failed")])
+        setup.cloud_json = Mock(side_effect=[{"ip": IP}, ValueError("exit probe failed")]
+                                + [ValueError("exit probe failed")] * 4)
         url = "https://www.tiktok.com/"
         setup.cloud_http = Mock(side_effect=[{"url": url, "http_status": 200}, ValueError("TLS failed")])
-        with patch("setup_proxy.time.monotonic", side_effect=[0, 0, 0, 2]), patch("setup_proxy.time.sleep"):
+        with patch("setup_proxy.time.sleep"):
             result = setup.verify(DB, IP, dict(CONFIG, probe_urls=[url], verify_rounds=2), 1)
         self.assertFalse(result["verified"])
         self.assertNotIn("exit_ip", result)
         self.assertEqual(result["web_checks"], [])
         self.assertEqual(result["completed_rounds"], 0)
-        self.assertEqual(result["error"], "exit probe failed")
-        self.assertEqual(result["attempt_errors"], ["TLS failed", "exit probe failed"])
+        self.assertIn("exit probe failed", result["error"])
+        self.assertEqual(result["attempt_errors"], ["TLS failed"] + ["exit probe failed"] * 4)
 
     def test_web_check_requires_real_exit_code_and_successful_http_status(self):
         setup = ProxySetup(HOST)
@@ -636,6 +844,22 @@ class ProxyTests(unittest.TestCase):
                 self.assertTrue(result["started_by_script"])
                 setup.device.post_action.assert_called_once_with("run", [DB])
                 setup.device.restore_stopped.assert_not_called()
+
+    def test_restore_evidence_avoids_more_reads_and_preserves_original_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            setup = self.make_setup(temp, "stopped")
+            setup.verify.return_value = {"verified": False, "error": "exit mismatch"}
+            setup.device.restore_stopped.return_value = {
+                "success": False, "states": {DB: "running"}, "unconfirmed": [DB],
+                "stop_requested": True, "error": "五轮停机仍未确认", "raw": "private-pass"}
+            result = self.execute(setup, start_stopped=True)
+            self.assertFalse(result["success"])
+            self.assertIn("exit mismatch", result["error"])
+            self.assertIn("恢复原停机状态未确认", result["error"])
+            self.assertEqual(result["final_state"], "running")
+            self.assertEqual(result["restore_state"]["unconfirmed"], [DB])
+            self.assertNotIn("raw", result["restore_state"])
+            setup.device.list_instances.assert_called_once()
 
     def test_verify_only_preserves_install_report_mapping_and_device_state(self):
         with tempfile.TemporaryDirectory() as temp:

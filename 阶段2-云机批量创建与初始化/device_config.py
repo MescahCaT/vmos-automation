@@ -31,8 +31,7 @@ OUTPUT_FILES = {
 # 轮询配置
 POLL_CONFIG = {
     "interval": 3,
-    "max_attempts": 200,
-    "create_check_attempts": 20,
+    "max_attempts": 5,
     "batch_size": 10
 }
 

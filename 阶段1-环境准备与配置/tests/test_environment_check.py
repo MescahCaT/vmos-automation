@@ -1,8 +1,10 @@
 """不访问真实主机、不读取实际凭据的阶段1回归检查。"""
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import io
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -13,6 +15,108 @@ import relay_proxy
 
 
 class EnvironmentTests(unittest.TestCase):
+    def test_time_only_waits_have_no_attempt_cap_and_stop_at_two_minutes(self):
+        elapsed = [0]
+        def sleep(seconds):
+            elapsed[0] += seconds
+        with patch("check_vmos_connection.time.monotonic", side_effect=lambda: elapsed[0]), \
+                patch("check_vmos_connection.time.sleep", side_effect=sleep):
+            with env.time_only_waits():
+                check = Mock(side_effect=[ValueError("starting")] * 24 + ["ready"])
+                self.assertEqual(env.poll_readback(check, Mock(), "startup", timeout=300, attempts=5), "ready")
+                self.assertEqual(check.call_count, 25)
+                self.assertEqual(elapsed[0], 48)
+                check = Mock(side_effect=ValueError("starting"))
+                elapsed[0] = 0
+                with self.assertRaisesRegex(ValueError, "等待窗口120秒"):
+                    env.poll_readback(check, Mock(), "startup", timeout=300, attempts=20)
+                self.assertEqual(elapsed[0], 120)
+                self.assertGreater(check.call_count, 20)
+            elapsed[0] = 0
+            check = Mock(side_effect=ValueError("starting"))
+            with self.assertRaisesRegex(ValueError, "5/5轮"):
+                env.poll_readback(check, Mock(), "outside")
+            self.assertEqual(check.call_count, 5)
+
+    def test_startup_poll_allows_twenty_reads_and_stops_at_five_minutes(self):
+        elapsed = [0]
+        def sleep(seconds):
+            elapsed[0] += seconds
+        check = Mock(side_effect=[ValueError("starting")] * 19 + ["ready"])
+        with patch("check_vmos_connection.time.monotonic", side_effect=lambda: elapsed[0]), \
+                patch("check_vmos_connection.time.sleep", side_effect=sleep):
+            self.assertEqual(env.poll_readback(check, Mock(), "startup", timeout=300, interval=15,
+                                              attempts=20, backoff=False), "ready")
+        self.assertEqual(check.call_count, 20)
+        self.assertEqual(elapsed[0], 285)
+
+        elapsed[0] = 0
+        def slow_check():
+            elapsed[0] += 20
+            raise ValueError("starting")
+        check = Mock(side_effect=slow_check)
+        with patch("check_vmos_connection.time.monotonic", side_effect=lambda: elapsed[0]), \
+                patch("check_vmos_connection.time.sleep", side_effect=sleep), self.assertRaises(ValueError):
+            env.poll_readback(check, Mock(), "startup", timeout=300, interval=15, attempts=20, backoff=False)
+        self.assertLess(check.call_count, 20)
+        self.assertEqual(elapsed[0], 300)
+
+    def test_readback_retries_at_most_five_and_accepts_fifth_result(self):
+        attempts = []
+        def check():
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < 5:
+                raise ValueError("not ready")
+            return "confirmed"
+        with patch("check_vmos_connection.time.sleep"):
+            self.assertEqual(env.poll_readback(check, Mock(), "test"), "confirmed")
+        self.assertEqual(len(attempts), 5)
+
+        attempts.clear()
+        with patch("check_vmos_connection.time.sleep"), self.assertRaisesRegex(ValueError, "5/5轮"):
+            env.poll_readback(lambda: attempts.append(1) or (_ for _ in ()).throw(ValueError("not ready")),
+                              Mock(), "test")
+        self.assertEqual(len(attempts), 5)
+
+    def test_readback_zero_window_is_single_fast_confirmation(self):
+        check = Mock(side_effect=ValueError("not ready"))
+        with self.assertRaises(ValueError), patch("check_vmos_connection.time.sleep") as sleep:
+            env.poll_readback(check, Mock(), "busy", timeout=0)
+        check.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_nested_readback_shares_attempts_and_restores_timeout_context(self):
+        inner = Mock(side_effect=ValueError("not ready"))
+        def outer():
+            self.assertLessEqual(env.request_timeout(30)[1], 10)
+            return env.poll_readback(inner, Mock(), "inner")
+        with patch("check_vmos_connection.time.sleep"), self.assertRaisesRegex(ValueError, "5/5轮"):
+            env.poll_readback(outer, Mock(), "outer")
+        self.assertEqual(inner.call_count, 5)
+        self.assertEqual(env.request_timeout(30), (5, 30))
+
+    def test_readback_deadline_limits_http_and_is_isolated_between_workers(self):
+        def check():
+            with patch("check_vmos_connection.time.monotonic", return_value=2):
+                with self.assertRaisesRegex(ValueError, "等待窗口已结束"):
+                    env.request_timeout(30)
+            return True
+        with patch("check_vmos_connection.time.monotonic", return_value=0):
+            self.assertTrue(env.poll_readback(check, Mock(), "test", timeout=1))
+        self.assertEqual(env.request_timeout(30), (5, 30))
+
+        barrier = threading.Barrier(2)
+        def worker(timeout):
+            def read():
+                barrier.wait(timeout=5)
+                return env.request_timeout(30)[1]
+            return env.poll_readback(read, Mock(), "worker", timeout=timeout)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = pool.submit(worker, 1), pool.submit(worker, 60)
+            self.assertLessEqual(first.result(timeout=5), 0.5)
+            self.assertEqual(second.result(timeout=5), 10)
+        self.assertEqual(env.request_timeout(30), (5, 30))
+
     def test_relay_probe_uses_local_chain_and_does_not_return_credentials(self):
         proxy = {"id": "chain", "protocol": "socks5", "host": "198.51.100.1", "port": 1080,
                  "username": "private-user", "password": "private-pass",

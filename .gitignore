@@ -24,6 +24,7 @@ dist/
 /配置文件/*.json
 /配置文件/*.yaml
 /配置文件/*.yml
+/主机配置/
 !/配置文件/*.example.json
 !/配置文件/*.example.yaml
 !/配置文件/*.example.yml
@@ -40,6 +41,11 @@ dist/
 *~
 /analysis.txt
 /剩余云机-*.json
+# Account spreadsheets and interrupted login state contain private data.
+*账号*.xls
+*账号*.xlsx
+**/login_session-*.json
+**/.login-*.lock
 
 # Generated device, proxy, system and installation results
 /阶段2-云机批量创建与初始化/*.json

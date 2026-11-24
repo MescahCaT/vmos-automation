@@ -19,6 +19,11 @@ ACTUAL = {"country": "US", "locale": "en-US", "timezone": "America/Los_Angeles",
 
 
 class SystemTests(unittest.TestCase):
+    def setUp(self):
+        sleep = patch("setup_system.time.sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
+
     def test_gps_snapshot_uses_target_control_port_and_checks_http_status(self):
         proxy = Mock()
         proxy.control_api.return_value = (200, {"code": 200, "data": {
@@ -70,6 +75,66 @@ class SystemTests(unittest.TestCase):
         system.reboot.assert_called_once_with(DB, report)
         self.assertEqual(system.snapshot.call_count, 2)
 
+    def test_unverified_submission_writes_settings_without_reads_or_reboot_even_after_timeouts(self):
+        for uncertain in (False, True):
+            with self.subTest(uncertain=uncertain):
+                system = self.make_system()
+                system.snapshot.side_effect = AssertionError("region readback requested")
+                system.shell.side_effect = AssertionError("Android properties requested")
+                system.reboot.side_effect = AssertionError("reboot requested")
+                if uncertain:
+                    system.proxy.api.side_effect = requests.ReadTimeout("private response")
+                    system.proxy.control_api.return_value = (200, {"code": 0})
+                    system.proxy.session.post.side_effect = requests.ReadTimeout("private response")
+                report = system.configure(DB, REGION, {}, verify_result=False)
+                self.assertTrue(report["settings_attempted"])
+                self.assertEqual(report["requests_accepted"], not uncertain)
+                self.assertFalse(report["success"])
+                self.assertFalse(report["verification_requested"])
+                self.assertFalse(report["country_api_confirmed"])
+                self.assertNotIn("gps_persisted", report)
+                self.assertNotIn("reboot_verified", report)
+                self.assertEqual([step["action"] for step in report["steps"]],
+                                 ["country_set", "timezone_set", "language_set", "gps_inject", "gps_persist"])
+                self.assertEqual([c.args[1] for c in system.proxy.api.call_args_list],
+                                 ["country_set", "language_set", "gps_inject"])
+                system.proxy.control_api.assert_called_once_with(
+                    "POST", "system/update_settings", DB, {"timezone": REGION["timezone"]})
+                system.proxy.session.post.assert_called_once()
+                self.assertFalse(system.proxy.session.post.call_args.kwargs["json"]["isRestart"])
+                system.snapshot.assert_not_called()
+                system.shell.assert_not_called()
+                system.reboot.assert_not_called()
+                self.assertNotIn("private response", json.dumps(report))
+
+    def test_unverified_missing_gps_writes_region_without_network_or_old_completion_checks(self):
+        system = self.make_system()
+        region = {key: value for key, value in REGION.items() if key not in ("latitude", "longitude")}
+        previous = {"expected": REGION, "country_api_confirmed": True, "gps_persisted": True}
+        report = system.configure(DB, region, {}, previous=previous, verify_result=False)
+        self.assertTrue(report["settings_attempted"])
+        self.assertTrue(report["requests_accepted"])
+        self.assertIn("未配置GPS", report["gps_skipped"])
+        self.assertFalse(report["success"])
+        self.assertEqual([step["action"] for step in report["steps"]],
+                         ["country_set", "timezone_set", "language_set"])
+        self.assertEqual([c.args[1] for c in system.proxy.api.call_args_list], ["country_set", "language_set"])
+        system.proxy.session.post.assert_not_called()
+        system.snapshot.assert_not_called()
+        system.shell.assert_not_called()
+        system.reboot.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "必须解析GPS"):
+            system.configure(DB, region, {})
+
+    def test_unverified_submission_still_validates_inputs_and_rejects_verify_only(self):
+        system = self.make_system()
+        for expected, options in ((dict(REGION, language="bad;cmd"), {}), (REGION, {"verify_only": True})):
+            with self.assertRaises(ValueError):
+                system.configure(DB, expected, {}, verify_result=False, **options)
+        system.proxy.api.assert_not_called()
+        system.proxy.control_api.assert_not_called()
+        system.proxy.session.post.assert_not_called()
+
     def test_recorded_matching_settings_skip_all_writes_and_verify_is_read_only(self):
         system = self.make_system()
         previous = {"expected": REGION, "country_api_confirmed": True, "gps_persisted": True}
@@ -95,14 +160,15 @@ class SystemTests(unittest.TestCase):
         system = self.make_system()
         system.proxy.api.side_effect = requests.Timeout("sensitive raw response")
         report = {}
-        with self.assertRaises(requests.Timeout):
+        with self.assertRaisesRegex(ValueError, "国家回查未确认"):
             system.configure(DB, REGION, report)
         self.assertFalse(report["success"])
         self.assertEqual(system.proxy.api.call_count, 1)
+        self.assertNotIn("sensitive raw response", json.dumps(report))
         self.assertFalse(report["steps"][0]["accepted"])
         system.reboot.assert_not_called()
         system = self.make_system()
-        system.snapshot.side_effect = [ACTUAL, dict(ACTUAL, latitude=26.0614)]
+        system.snapshot.side_effect = [ACTUAL] + [dict(ACTUAL, latitude=26.0614)] * 5
         report = {}
         with self.assertRaises(ValueError):
             system.configure(DB, REGION, report)
@@ -146,7 +212,7 @@ class SystemTests(unittest.TestCase):
                 self.assertEqual(writes, ["country_set"])
                 system.proxy.control_api.assert_called_once_with("POST", "system/update_settings", DB,
                                                                  {"timezone": REGION["timezone"]})
-                self.assertEqual(system.shell.call_count, 3)
+                self.assertEqual(system.shell.call_count, 5)
                 system.proxy.session.post.assert_not_called()
                 system.reboot.assert_not_called()
 
@@ -157,7 +223,7 @@ class SystemTests(unittest.TestCase):
             (200, {"code": 200, "data": dict(ACTUAL)}), (200, {"code": 200}), (200, {"code": 200})]
         shell = system.shell.side_effect
         system.shell.side_effect = lambda db, cmd: REGION["timezone"] if cmd == "getprop persist.sys.timezone" else shell(db, cmd)
-        system.snapshot.side_effect = [ACTUAL, dict(ACTUAL, timezone="GMT")]
+        system.snapshot.side_effect = [ACTUAL] + [dict(ACTUAL, timezone="GMT")] * 5
         report = {}
         with patch("setup_system.time.sleep"), self.assertRaisesRegex(ValueError, "重启后地区参数或GPS未保留"):
             system.configure(DB, REGION, report)
@@ -212,9 +278,10 @@ class SystemTests(unittest.TestCase):
                 self.assertFalse(report["success"])
                 self.assertEqual([c.args[1] for c in system.proxy.api.call_args_list if c.args[0] == "POST"],
                                  ["country_set", "language_set"])
-                system.shell.assert_has_calls([call(DB, "getprop persist.sys.locale")] * 3)
+                self.assertEqual(system.shell.call_count, 5)
+                system.shell.assert_has_calls([call(DB, "getprop persist.sys.locale")] * 5)
                 reads = [c for c in system.proxy.api.call_args_list if c.args[0] == "GET"]
-                self.assertEqual(len(reads), 3 if actual == "en-US" else 0)
+                self.assertEqual(len(reads), 5 if actual == "en-US" else 0)
                 system.proxy.session.post.assert_not_called()
                 system.reboot.assert_not_called()
 
@@ -234,18 +301,19 @@ class SystemTests(unittest.TestCase):
             return value
         system.shell.side_effect = read
         report = {}
-        # 三轮以内未能双源确认就停止，不把查询超时当成成功。
-        with patch("setup_system.time.sleep"), self.assertRaisesRegex(ValueError, "语言回查未确认"):
-            system.configure(DB, REGION, report)
-        self.assertFalse(report["success"])
-        system.reboot.assert_not_called()
+        # 第4轮双源确认成功，允许继续且不重发语言设置。
+        system.configure(DB, REGION, report)
+        self.assertTrue(report["success"])
+        self.assertTrue(report["steps"][2]["readback_verified"])
+        self.assertEqual(sum(c.args[1] == "language_set" for c in system.proxy.api.call_args_list), 1)
+        system.reboot.assert_called_once()
 
         system = self.make_system()
         system.proxy.api.side_effect = [(200, {"code": 200}), (200, {"code": 0}), requests.Timeout(),
             (200, {"code": 200, "data": dict(ACTUAL)}), (200, {"code": 200})]
         shell = system.shell.side_effect
         system.shell.side_effect = lambda db, cmd: "en-US" if cmd == "getprop persist.sys.locale" else shell(db, cmd)
-        system.snapshot.side_effect = [ACTUAL, dict(ACTUAL, locale="en-CN")]
+        system.snapshot.side_effect = [ACTUAL] + [dict(ACTUAL, locale="en-CN")] * 5
         report = {}
         with patch("setup_system.time.sleep"), self.assertRaisesRegex(ValueError, "重启后地区参数或GPS未保留"):
             system.configure(DB, REGION, report)
@@ -285,7 +353,7 @@ class SystemTests(unittest.TestCase):
                 system.request = Mock(return_value={"country": "CN", "locale": "en-CN", "timezone": "GMT"})
                 proxy.control_api.return_value = (200, {"code": 200, "data": {
                     "latitude": ACTUAL["latitude"], "longitude": ACTUAL["longitude"]}})
-                system.shell = Mock(side_effect=["US", "US", "US", "US"])
+                system.shell = Mock(return_value="US")
                 system.reboot = Mock()
                 report = {}
                 with self.assertRaisesRegex(ValueError, "地区接口与Android实际参数不一致: country"):
@@ -302,7 +370,7 @@ class SystemTests(unittest.TestCase):
         system.proxy.session.post.assert_called_once()
         system.reboot.assert_called_once()
 
-    def test_persistence_rejection_or_timeout_never_restarts_or_resubmits(self):
+    def test_persistence_uncertain_response_reads_actual_values_and_never_resubmits(self):
         for failure in (ValueError("rejected"), requests.Timeout()):
             with self.subTest(failure=type(failure).__name__):
                 system = self.make_system()
@@ -311,12 +379,23 @@ class SystemTests(unittest.TestCase):
                 else:
                     system.proxy.session.post.return_value.json.return_value = {"code": 0}
                 report = {}
-                with self.assertRaises(type(failure)):
-                    system.configure(DB, REGION, report)
-                self.assertFalse(report["success"])
+                system.configure(DB, REGION, report)
+                self.assertTrue(report["success"])
                 self.assertFalse(report["steps"][-1]["accepted"])
+                self.assertTrue(report["steps"][-1]["readback_verified"])
                 system.proxy.session.post.assert_called_once()
-                system.reboot.assert_not_called()
+                system.reboot.assert_called_once()
+
+        system = self.make_system()
+        system.proxy.session.post.side_effect = requests.Timeout()
+        system.shell = Mock(return_value="0")
+        report = {}
+        with self.assertRaisesRegex(ValueError, "GPS持久属性保存回查"):
+            system.configure(DB, REGION, report)
+        system.proxy.session.post.assert_called_once()
+        self.assertEqual(system.shell.call_count, 5)
+        system.reboot.assert_not_called()
+        self.assertFalse(report["success"])
 
     def test_runtime_gps_match_cannot_hide_wrong_or_invalid_persisted_properties(self):
         for actual in ("33.3028", "", "nan"):
@@ -338,7 +417,7 @@ class SystemTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "get_timezone_locale"):
             system.configure(DB, REGION, report)
         self.assertFalse(report["success"])
-        system.request.assert_called_once_with("get_timezone_locale", DB)
+        self.assertEqual(system.request.call_args_list, [call("get_timezone_locale", DB)] * 5)
 
     def test_region_validation_and_exit_geo_country_mismatch_block_writes(self):
         for fields in ({"country": "us"}, {"timezone": "US"}, {"language": "en;bad"},
@@ -408,10 +487,10 @@ class SystemTests(unittest.TestCase):
             with self.subTest(observed=observed, completed=completed):
                 system = SystemSetup(Mock())
                 system.proxy.device.post_action.return_value = {"code": 200}
-                system.shell = Mock(side_effect=[before, observed, completed])
+                system.shell = Mock(side_effect=[before] + [observed, completed] * 20)
                 system.snapshot = Mock()
                 report = {}
-                with patch("setup_system.time.sleep"), patch("setup_system.time.monotonic", side_effect=[0, 0, 1, 3]):
+                with patch("setup_system.time.sleep"):
                     with self.assertRaisesRegex(ValueError, "未重发重启"):
                         system.reboot(DB, report, timeout=3)
                 self.assertNotIn("reboot_verified", report)
@@ -424,14 +503,28 @@ class SystemTests(unittest.TestCase):
         system.proxy.device.post_action.assert_not_called()
         system = SystemSetup(Mock())
         system.proxy.device.post_action.return_value = {"code": 200}
-        system.shell = Mock(side_effect=[before, after, "1"])
+        system.shell = Mock(side_effect=[before] + [after, "1"] * 20)
         system.snapshot = Mock(side_effect=ValueError("地区或GPS回查失败"))
         report = {}
-        with patch("setup_system.time.sleep"), patch("setup_system.time.monotonic", side_effect=[0, 0, 1, 3]):
+        with patch("setup_system.time.sleep"):
             with self.assertRaisesRegex(ValueError, "未重发重启"):
                 system.reboot(DB, report, timeout=3)
         self.assertNotIn("reboot_verified", report)
         self.assertEqual(report["reboot_last_error"], "地区或GPS回查失败")
+        self.assertEqual(system.snapshot.call_count, 20)
+
+    def test_reboot_allows_twentieth_boot_and_region_readback_within_five_minutes(self):
+        before = "11111111-1111-4111-8111-111111111111"
+        after = "22222222-2222-4222-8222-222222222222"
+        system = SystemSetup(Mock())
+        system.proxy.device.post_action.return_value = {"code": 200}
+        system.shell = Mock(side_effect=[before] + [after, "1"] * 20)
+        system.snapshot = Mock(side_effect=[ValueError("地区API启动中")] * 19 + [ACTUAL])
+        report = {}
+        system.reboot(DB, report)
+        self.assertTrue(report["reboot_verified"])
+        self.assertEqual(system.snapshot.call_count, 20)
+        system.proxy.device.post_action.assert_called_once_with("reboot", [DB])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,100 @@
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from upload_materials import archive_file, parse_task_list, plan_pool_uploads, upload_file
+
+
+class UploadMaterialsTests(unittest.TestCase):
+    def test_pool_assigns_distinct_first_level_supported_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / "a.mp4").write_bytes(b"a")
+            (folder / "b.PNG").write_bytes(b"b")
+            (folder / "skip.txt").write_bytes(b"x")
+            nested = folder / "nested"
+            nested.mkdir()
+            (nested / "c.jpg").write_bytes(b"c")
+
+            assets, _ = plan_pool_uploads(folder, ["device-001", "device-002"], 1)
+
+            self.assertEqual([asset["path"].name for asset in assets], ["a.mp4", "b.PNG"])
+            self.assertEqual(len({asset["path"] for asset in assets}), 2)
+
+    def test_pool_shortage_fails_during_planning(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "only.mp4").write_bytes(b"a")
+            with self.assertRaisesRegex(ValueError, "素材不足"):
+                plan_pool_uploads(Path(temp), ["device-001", "device-002"], 1)
+
+    def test_task_folder_is_first_level_and_filters_extensions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            folder = root / "assets"
+            folder.mkdir()
+            (folder / "a.mp4").write_bytes(b"a")
+            (folder / "b.jpeg").write_bytes(b"b")
+            (folder / "ignore.gif").write_bytes(b"x")
+            nested = folder / "nested"
+            nested.mkdir()
+            (nested / "ignore.png").write_bytes(b"x")
+            task_file = root / "tasks.tsv"
+            task_file.write_text(f"device-001\t{folder}\n", encoding="utf-8")
+
+            assets, skipped = parse_task_list(task_file, {"device-001"})
+
+            self.assertEqual([asset["path"].name for asset in assets], ["a.mp4", "b.jpeg"])
+            self.assertEqual([item["file"] for item in skipped], ["ignore.gif"])
+
+    def test_archive_does_not_overwrite_existing_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "clip.mp4"
+            source.write_bytes(b"new")
+            archive = Path(temp) / "已上传"
+            archive.mkdir()
+            (archive / "clip.mp4").write_bytes(b"old")
+
+            result = archive_file(source)
+
+            self.assertEqual(Path(result["path"]).name, "clip (1).mp4")
+            self.assertEqual((archive / "clip.mp4").read_bytes(), b"old")
+            self.assertEqual((archive / "clip (1).mp4").read_bytes(), b"new")
+
+    def test_upload_disables_scan_and_checks_remote_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "clip.mp4"
+            path.write_bytes(b"data")
+            asset = {"path": path, "size_bytes": 4, "mime_type": "video/mp4"}
+            body = json.dumps({"code": 200, "data": {"files": [{
+                "file_path": "/sdcard/DCIM/Codex/clip.mp4", "file_size": 4, "scanned": False
+            }]}}).encode() + b"\n200"
+
+            def fake_run(command, **kwargs):
+                self.assertEqual(kwargs["stdin"].read(), b"data")
+                return subprocess.CompletedProcess(command, 0, stdout=body, stderr=b"")
+
+            with patch("upload_materials.subprocess.run", side_effect=fake_run) as run:
+                result = upload_file("curl.exe", "http://127.0.0.1/api", asset,
+                                     "/sdcard/DCIM/Codex/", 10)
+
+            self.assertTrue(result["success"])
+            command = run.call_args.args[0]
+            self.assertIn("scan=false", command)
+            self.assertIn("file=@-;filename=\"clip.mp4\";type=video/mp4", command)
+
+            body = body.replace(b"/sdcard/DCIM/Codex/clip.mp4", b"/sdcard/Download/clip.mp4")
+            with patch("upload_materials.subprocess.run", return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=body, stderr=b"")):
+                result = upload_file("curl.exe", "http://127.0.0.1/api", asset,
+                                     "/sdcard/DCIM/Codex/", 10)
+            self.assertFalse(result["success"])
+            self.assertEqual(result["status"], "unconfirmed")
+
+
+if __name__ == "__main__":
+    unittest.main()

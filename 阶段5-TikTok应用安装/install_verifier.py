@@ -1,6 +1,11 @@
 import requests
 import time
 from typing import List, Dict, Optional
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "阶段1-环境准备与配置"))
+from check_vmos_connection import poll_readback, request_timeout
 
 
 def parse_app_list(result):
@@ -28,16 +33,19 @@ class InstallVerifier:
         self.session = session or requests.Session()
         self.session.trust_env = False
 
+    def query_app_list(self, db_id: str) -> List[str]:
+        """读取真实包名列表；异常交由有限回查处理。"""
+        resp = self.session.get(
+            f"{self.base_url}/android_api/v1/app_get/{db_id}",
+            timeout=request_timeout(10)
+        )
+        resp.raise_for_status()
+        return parse_app_list(resp.json())
+
     def get_app_list(self, db_id: str) -> Optional[List[str]]:
-        """获取设备已安装应用列表"""
+        """兼容旧调用：查询失败返回None。"""
         try:
-            resp = self.session.get(
-                f"{self.base_url}/android_api/v1/app_get/{db_id}",
-                timeout=(5, 10)
-            )
-            resp.raise_for_status()
-            result = resp.json()
-            return parse_app_list(result)
+            return self.query_app_list(db_id)
         except (requests.RequestException, ValueError):
             return None
 
@@ -69,21 +77,40 @@ class InstallVerifier:
         return result
 
     def wait_for_install(self, db_ids, timeout=300, package_name="com.zhiliaoapp.musically", log=print):
-        deadline = time.monotonic() + timeout
         remaining = list(db_ids)
         success = []
         last_query = {}
-        while remaining:
+        attempts = 0
+
+        def check():
+            nonlocal attempts
+            attempts += 1
+            errors = []
             for db_id in remaining[:]:
-                apps = self.get_app_list(db_id)
-                last_query[db_id] = "unavailable" if apps is None else "package_absent"
-                if apps is not None and package_name in apps:
+                try:
+                    apps = self.get_app_list(db_id)
+                    if apps is None:
+                        raise ValueError("应用列表查询未确认")
+                except (requests.RequestException, ValueError, TypeError) as error:
+                    last_query[db_id] = "unavailable"
+                    errors.append(type(error).__name__)
+                    continue
+                if package_name in apps:
                     last_query[db_id] = "package_present"
                     success.append(db_id)
                     remaining.remove(db_id)
                     log(f"安装已确认: {db_id}")
-            if not remaining or time.monotonic() >= deadline:
-                break
-            log(f"等待安装: {len(success)}/{len(db_ids)} 已确认")
-            time.sleep(min(5, max(0, deadline - time.monotonic())))
+                else:
+                    last_query[db_id] = "package_absent"
+            if remaining:
+                log(f"安装回查第{attempts}轮: {len(success)}/{len(db_ids)} 已确认")
+                detail = "应用列表暂不可用" if errors else "包名尚未出现"
+                raise ValueError(detail)
+            return True
+
+        try:
+            poll_readback(check, log, "TikTok安装包名回查", timeout=max(0, timeout),
+                          interval=max(1, timeout / 8) if timeout else 1)
+        except ValueError:
+            pass
         return {"success": success, "unconfirmed": remaining, "last_query": last_query}

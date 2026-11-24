@@ -113,7 +113,7 @@ class CreateResultTests(unittest.TestCase):
             self.assertIsNone(self.creator.create_single(1, self.spec))
         self.assertEqual(self.creator.created_devices, [])
         self.assertEqual(self.creator.creation_results[-1]["status"], "unconfirmed")
-        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_count, 0)
 
     def test_unfinished_or_failed_instance_is_not_success(self):
         for state in ("creating", "failed", "error", "deleting"):
@@ -126,7 +126,7 @@ class CreateResultTests(unittest.TestCase):
 
     def test_multiple_new_matches_remain_unconfirmed(self):
         items = [{"user_name": "test-001", "db_id": db_id} for db_id in ("EDGE001", "EDGE002")]
-        with patch("create_devices.requests.get", side_effect=[instance_list([]), instance_list(items)]), patch(
+        with patch("create_devices.requests.get", side_effect=[instance_list([])] + [instance_list(items)] * 5), patch(
             "create_devices.requests.post", return_value=response({"code": 200, "data": None})
         ):
             self.assertIsNone(self.creator.create_single(1, self.spec))
@@ -134,13 +134,13 @@ class CreateResultTests(unittest.TestCase):
 
     def test_missing_baseline_does_not_claim_existing_device(self):
         with patch("create_devices.requests.get", side_effect=requests.Timeout("query timeout")) as get, patch(
-            "create_devices.requests.post", side_effect=[
-                requests.Timeout("fallback query timeout"), response({"code": 200, "data": None})
-            ]
-        ):
+            "create_devices.requests.post", side_effect=requests.Timeout("fallback query timeout")
+        ) as post:
             self.assertIsNone(self.creator.create_single(1, self.spec))
-        self.assertEqual(get.call_count, 1)
+        self.assertEqual(get.call_count, 5)
+        self.assertEqual(post.call_count, 5)
         self.assertIn("before_query_error", self.creator.creation_results[-1])
+        self.assertEqual(self.creator.creation_results[-1]["status"], "unconfirmed")
 
     def test_list_names_failure_falls_back_to_get_db(self):
         item = {"user_name": "test-001", "db_id": "EDGE001", "state": "stopped"}

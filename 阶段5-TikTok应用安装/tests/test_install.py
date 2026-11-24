@@ -8,7 +8,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import requests
 
@@ -17,6 +17,7 @@ from apk_uploader import ApkUploader
 from install_verifier import InstallVerifier, parse_app_list
 from install_tiktok import INSTALL_LOCK, TikTokInstaller, device_ids, parse_instances
 from permission_manager import PermissionManager
+from check_vmos_connection import time_only_waits
 
 
 DB = "EDGE123456"
@@ -24,6 +25,98 @@ PACKAGE = "com.zhiliaoapp.musically"
 
 
 class InstallTests(unittest.TestCase):
+    def test_submission_callback_precedes_package_verification(self):
+        with tempfile.TemporaryDirectory() as temp:
+            apk = Path(temp) / "app.apk"
+            apk.write_bytes(b"apk")
+            installer = self.make_installer(temp)
+            installer.verifier.get_app_list.return_value = []
+            installer.uploader.upload_local.return_value = {"http_status": 200, "code": 200}
+            submitted = Mock()
+            def verify(*args):
+                submitted.assert_called_once_with()
+                return {"success": [DB], "unconfirmed": []}
+            installer.verifier.wait_for_install.side_effect = verify
+            result = installer.install_from_local(apk, [DB], on_submitted=submitted)
+            self.assertTrue(result["success"])
+            installer.uploader.upload_local.assert_called_once()
+
+    def test_initialization_rom_package_and_stop_waits_exceed_old_round_caps(self):
+        elapsed = [0]
+        def sleep(seconds):
+            elapsed[0] += seconds
+        installer = TikTokInstaller("http://host")
+        installer.log = Mock()
+        installer.session.get = Mock(side_effect=[Mock(json=Mock(return_value={"code": 0}))] * 24
+                                     + [Mock(json=Mock(return_value={"code": 200}))])
+        verifier = InstallVerifier("http://host")
+        verifier.get_app_list = Mock(side_effect=[[]] * 24 + [[PACKAGE]])
+        installer.list_instances = Mock(side_effect=[{DB: {"state": "running"}}] * 24
+                                        + [{DB: {"state": "stopped"}}])
+        installer.post_action = Mock(return_value={"code": 200})
+        with patch("check_vmos_connection.time.monotonic", side_effect=lambda: elapsed[0]), \
+                patch("check_vmos_connection.time.sleep", side_effect=sleep), time_only_waits():
+            self.assertEqual(installer.wait_ready([DB]), [DB])
+            self.assertEqual(verifier.wait_for_install([DB], log=Mock())["success"], [DB])
+            self.assertTrue(installer.restore_stopped([DB])["success"])
+            self.assertEqual(installer.session.get.call_count, 25)
+            self.assertEqual(verifier.get_app_list.call_count, 25)
+            self.assertEqual(installer.list_instances.call_count, 25)
+            installer.post_action.assert_called_once_with("stop", [DB])
+            elapsed[0] = 0
+            verifier.get_app_list = Mock(return_value=[])
+            self.assertEqual(verifier.wait_for_install([DB], log=Mock())["unconfirmed"], [DB])
+            self.assertEqual(elapsed[0], 120)
+
+    def test_initialization_upload_and_queue_wait_in_two_minute_windows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            apk = Path(temp) / "app.apk"
+            apk.write_bytes(b"apk")
+            installer = self.make_installer(temp)
+            installer.verifier.get_app_list.return_value = None
+            installer.uploader.upload_local.return_value = {"code": 200, "success": True}
+            installer.verifier.wait_for_install.return_value = {"success": [DB], "unconfirmed": []}
+            self.assertTrue(installer.install_from_local(apk, [DB], wait_time=120, request_wait=120)["success"])
+            installer.uploader.upload_local.assert_called_once_with(str(apk.resolve()), [DB], timeout=120)
+            installer.uploader.upload_local.return_value = {"http_status": 200, "code": 201,
+                                                          "msg": "当前有安装任务进行中，请稍后再试"}
+            installer.uploader.upload_local.reset_mock()
+            installer.uploader.upload_local.side_effect = [
+                {"http_status": 200, "code": 201, "msg": "当前有安装任务进行中，请稍后再试"},
+                {"http_status": 200, "code": 201, "msg": "当前有安装任务进行中，请稍后再试"},
+                {"http_status": 200, "code": 200, "success": True},
+            ]
+            installer.verifier.wait_for_install.reset_mock()
+            installer.verifier.wait_for_install.side_effect = [
+                {"success": [], "unconfirmed": [DB]},
+                {"success": [], "unconfirmed": [DB]},
+                {"success": [DB], "unconfirmed": []},
+            ]
+            self.assertTrue(installer.install_from_local(apk, [DB], wait_time=120, request_wait=120)["success"])
+            self.assertEqual(installer.uploader.upload_local.call_count, 3)
+            self.assertEqual(installer.verifier.wait_for_install.call_args.args[1], 120)
+            self.assertEqual(installer.verifier.wait_for_install.call_count, 3)
+            with patch("install_tiktok.INSTALL_LOCK") as queue:
+                queue.acquire.side_effect = [False, True]
+                installer.uploader.upload_local.side_effect = None
+                installer.uploader.upload_local.return_value = {"http_status": 200, "code": 200, "success": True}
+                installer.verifier.wait_for_install.side_effect = None
+                installer.verifier.wait_for_install.return_value = {"success": [DB], "unconfirmed": []}
+                result = installer.install_from_local(apk, [DB], wait_time=120, request_wait=120)
+                self.assertTrue(result["success"])
+                self.assertEqual(queue.acquire.call_args_list, [call(timeout=120)] * 2)
+                queue.release.assert_called_once()
+            uploader = ApkUploader("http://host")
+            with patch("apk_uploader.subprocess.run", return_value=Mock(returncode=0, stdout='{"code":200}\n200')) as run:
+                uploader.upload_local(apk, [DB], timeout=120)
+            self.assertEqual(run.call_args.kwargs["timeout"], 120)
+            self.assertIn("120", run.call_args.args[0])
+
+    def setUp(self):
+        sleep = patch("install_tiktok.time.sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
+
     def test_app_response_formats_and_business_failure(self):
         for data in ({"app": [PACKAGE]}, {"apps": [PACKAGE]}, {"apps": [{"package_name": PACKAGE}]}, [PACKAGE]):
             self.assertEqual(parse_app_list({"code": "200", "data": data}), [PACKAGE])
@@ -76,6 +169,62 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(result["success"], [DB])
             self.assertEqual(result["last_query"][DB], "package_present")
 
+    def test_install_package_can_appear_on_fifth_read_and_absence_stops_at_five(self):
+        verifier = InstallVerifier("http://host")
+        verifier.get_app_list = Mock(side_effect=[None, [], [], [], [PACKAGE]])
+        self.assertEqual(verifier.wait_for_install([DB], log=Mock())["success"], [DB])
+        self.assertEqual(verifier.get_app_list.call_count, 5)
+        verifier.get_app_list = Mock(return_value=[])
+        self.assertEqual(verifier.wait_for_install([DB], log=Mock())["unconfirmed"], [DB])
+        self.assertEqual(verifier.get_app_list.call_count, 5)
+
+    def test_rom_wait_uses_twenty_reads_and_restore_stays_at_five_outside_initialization(self):
+        installer = TikTokInstaller("http://host")
+        installer.log = Mock()
+        installer.session.get = Mock(return_value=Mock(json=Mock(return_value={"code": 0})))
+        self.assertEqual(installer.wait_ready([DB]), [])
+        self.assertEqual(installer.session.get.call_count, 20)
+        installer.list_instances = Mock(return_value={DB: {"state": "running"}})
+        installer.post_action = Mock(side_effect=requests.ReadTimeout())
+        self.assertFalse(installer.restore_stopped([DB])["success"])
+        self.assertEqual(installer.list_instances.call_count, 5)
+        installer.post_action.assert_called_once_with("stop", [DB])
+
+    def test_rom_can_become_ready_on_twentieth_read(self):
+        installer = TikTokInstaller("http://host")
+        installer.log = Mock()
+        installer.session.get = Mock(side_effect=[Mock(json=Mock(return_value={"code": 0}))] * 19
+                                     + [Mock(json=Mock(return_value={"code": 200}))])
+        self.assertEqual(installer.wait_ready([DB]), [DB])
+        self.assertEqual(installer.session.get.call_count, 20)
+
+    def test_local_package_presence_completes_without_app_launch_or_network_test(self):
+        with tempfile.TemporaryDirectory() as temp:
+            apk = Path(temp) / "app.apk"
+            apk.write_bytes(b"apk")
+            installer = self.make_installer(temp)
+            installer.verifier.get_app_list.return_value = [PACKAGE]
+            installer.session.request = Mock(side_effect=AssertionError("unexpected app or network request"))
+            result = installer.install_from_local(apk, [DB])
+            self.assertTrue(result["success"])
+            self.assertEqual(result["devices"][DB]["status"], "already_installed")
+            self.assertTrue(result["devices"][DB]["package_verified"])
+            installer.uploader.upload_local.assert_not_called()
+            installer.verifier.wait_for_install.assert_not_called()
+            installer.session.request.assert_not_called()
+
+    def test_uncertain_start_is_confirmed_by_rom_without_resending(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self.make_installer(temp)
+            installer.list_instances.return_value = {DB: {"state": "stopped"}}
+            installer.post_action = Mock(return_value={"code": 0})
+            installer.verifier.get_app_list.return_value = [PACKAGE]
+            result = installer.install_from_url("http://apk", [DB], start_stopped=True)
+            self.assertTrue(result["success"])
+            installer.post_action.assert_called_once_with("run", [DB])
+            installer.wait_ready.assert_called_once_with([DB])
+            installer.uploader.install_from_url.assert_not_called()
+
     def test_only_explicit_valid_targets_and_instance_envelopes(self):
         self.assertEqual(device_ids({"db_ids": [DB, DB]}), [DB])
         self.assertEqual(device_ids([{"db_id": DB}]), [DB])
@@ -110,6 +259,21 @@ class InstallTests(unittest.TestCase):
             installer.uploader.upload_local.assert_called_once()
             self.assertEqual(result["devices"][DB]["status"], "installed")
             self.assertTrue(json.loads((Path(temp) / "install_status.json").read_text(encoding="utf-8"))["success"])
+
+    def test_upload_timeout_error_is_preserved_when_package_is_not_confirmed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            apk = Path(temp) / "app.apk"
+            apk.write_bytes(b"apk")
+            installer = self.make_installer(temp)
+            installer.verifier.get_app_list.return_value = []
+            installer.uploader.upload_local.return_value = {
+                "success": False, "unconfirmed": True, "error": "TimeoutExpired"}
+            installer.verifier.wait_for_install.return_value = {
+                "success": [], "unconfirmed": [DB], "last_query": {DB: "package_absent"}}
+            result = installer.install_from_local(apk, [DB], wait_time=0)
+            self.assertFalse(result["success"])
+            self.assertIn("TimeoutExpired", result["devices"][DB]["error"])
+            installer.uploader.upload_local.assert_called_once()
 
     def test_local_and_url_installations_share_slot_until_package_verification_finishes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -171,6 +335,20 @@ class InstallTests(unittest.TestCase):
             self.assertIn("业务码201", result["devices"][DB]["error"])
             self.assertEqual(installer.verifier.wait_for_install.call_args.args[1], 0)
             installer.uploader.install_from_url.assert_called_once()
+
+    def test_initialization_busy_rejection_checks_package_before_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            installer = self.make_installer(temp)
+            installer.verifier.get_app_list.return_value = []
+            installer.verifier.wait_for_install.return_value = {"success": [DB], "unconfirmed": []}
+            installer.uploader.install_from_url.return_value = {
+                "http_status": 200, "code": 201, "msg": "当前有安装任务进行中，请稍后再试"}
+            result = installer.install_from_url("http://apk", [DB], wait_time=120, request_wait=120)
+            self.assertTrue(result["success"])
+            self.assertEqual(result["devices"][DB]["status"], "installed")
+            self.assertTrue(result["devices"][DB]["package_verified"])
+            installer.uploader.install_from_url.assert_called_once()
+            installer.verifier.wait_for_install.assert_called_once_with([DB], 120, PACKAGE, installer.log)
 
     def test_installation_slot_is_released_after_upload_exception(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -30,7 +30,7 @@ class ApkUploader:
                 "--form", 'file=@"' + apk.name + '"',
                 self.base_url + "/android_api/v1/upload_file_android_batch",
             ], cwd=apk.parent, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=timeout + 10)
+                errors="replace", timeout=timeout)
             if result.returncode:
                 return {"success": False, "unconfirmed": True,
                         "error": f"上传请求异常（curl退出码{result.returncode}），需回查安装状态"}

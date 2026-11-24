@@ -1,5 +1,6 @@
 """指定云机安装TikTok：启动、ROM检查、上传、回查；不自动扫描全部云机。"""
 import argparse
+from contextlib import contextmanager
 import json
 import re
 import threading
@@ -11,11 +12,31 @@ import requests
 from apk_uploader import ApkUploader
 from install_verifier import InstallVerifier
 from permission_manager import PermissionManager
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "阶段1-环境准备与配置"))
+from check_vmos_connection import STARTUP_ATTEMPTS, STARTUP_TIMEOUT, poll_readback, request_timeout
 
 
 ROOT = Path(__file__).resolve().parents[1]
 # ponytail: 当前单主机，进程内串行上传和安装确认；多主机时再按主机分锁。
 INSTALL_LOCK = threading.Lock()
+
+
+@contextmanager
+def installation_slot(timeout=None, log=None, repeat_wait=False):
+    while True:
+        acquired = INSTALL_LOCK.acquire() if timeout is None else INSTALL_LOCK.acquire(timeout=timeout)
+        if acquired:
+            break
+        if not repeat_wait:
+            raise ValueError(f"等待主机安装队列超时（{timeout}秒），未上传APK")
+        if log:
+            log(f"等待主机安装队列已满{timeout}秒，继续等待")
+    try:
+        yield
+    finally:
+        INSTALL_LOCK.release()
 
 
 def parse_instances(payload):
@@ -25,6 +46,8 @@ def parse_instances(payload):
     items = data.get("list") if isinstance(data, dict) else data
     if not isinstance(items, list) or any(not isinstance(item, dict) or not item.get("db_id") for item in items):
         raise ValueError("实例列表格式无法识别")
+    if any(not isinstance(item["db_id"], str) for item in items) or len({item["db_id"] for item in items}) != len(items):
+        raise ValueError("实例ID无效或重复，未操作云机")
     return {item["db_id"]: item for item in items}
 
 
@@ -66,37 +89,50 @@ class TikTokInstaller:
         print(line, flush=True)
 
     def list_instances(self):
-        response = self.session.get(self.base_url + "/container_api/v1/list_names", timeout=(5, 10))
+        response = self.session.get(self.base_url + "/container_api/v1/list_names", timeout=request_timeout(10))
         response.raise_for_status()
         return parse_instances(response.json())
 
     def post_action(self, action, db_ids):
         response = self.session.post(self.base_url + "/container_api/v1/" + action,
-                                     json={"db_ids": db_ids}, timeout=(5, 30))
+                                     json={"db_ids": db_ids}, timeout=request_timeout(30))
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("实例操作响应不是对象")
         return payload
 
-    def wait_ready(self, db_ids, timeout=180):
-        deadline = time.monotonic() + timeout
+    def wait_ready(self, db_ids, timeout=STARTUP_TIMEOUT):
         remaining = list(db_ids)
-        while remaining:
+        ready = []
+        attempts = 0
+
+        def check():
+            nonlocal attempts
+            attempts += 1
             for db_id in remaining[:]:
                 try:
                     response = self.session.get(self.base_url + "/container_api/v1/rom_status/" + db_id,
-                                                timeout=(5, 10))
+                                                timeout=request_timeout(10))
                     response.raise_for_status()
-                    if str(response.json().get("code")) == "200":
+                    payload = response.json()
+                    if isinstance(payload, dict) and str(payload.get("code")) == "200":
                         remaining.remove(db_id)
+                        ready.append(db_id)
                         self.log(f"ROM已就绪: {db_id}")
                 except (requests.RequestException, ValueError, AttributeError):
-                    pass
-            if not remaining or time.monotonic() >= deadline:
-                return [db_id for db_id in db_ids if db_id not in remaining]
-            self.log(f"等待ROM就绪: {len(db_ids) - len(remaining)}/{len(db_ids)}")
-            time.sleep(min(5, max(0, deadline - time.monotonic())))
+                    continue
+            if remaining:
+                self.log(f"等待ROM就绪: {len(ready)}/{len(db_ids)}（第{attempts}轮）")
+                raise ValueError("ROM尚未全部就绪")
+            return ready
+
+        try:
+            poll_readback(check, self.log, "ROM就绪回查", timeout=timeout, interval=timeout / STARTUP_ATTEMPTS,
+                          attempts=STARTUP_ATTEMPTS, backoff=False)
+        except ValueError:
+            pass
+        return ready
 
     def restore_stopped(self, db_ids, timeout=180):
         if not db_ids:
@@ -104,8 +140,8 @@ class TikTokInstaller:
         self.log("恢复原停机状态: " + ", ".join(db_ids))
         report = {"success": False, "devices": db_ids, "unconfirmed": list(db_ids),
                   "stop_requested": False}
-        deadline = time.monotonic() + timeout
-        while True:
+        def check():
+            nonlocal report
             try:
                 current = self.list_instances()
                 states = {db_id: current.get(db_id, {}).get("state", "unknown") for db_id in db_ids}
@@ -126,11 +162,14 @@ class TikTokInstaller:
                     # 受理或返回不明确都只回查；不能重复发送停机请求。
             except (requests.RequestException, ValueError) as error:
                 report["last_error"] = type(error).__name__
-            if time.monotonic() >= deadline:
-                report["error"] = "恢复停机超时；最后状态：" + str(report.get("states", {}))
-                return report
             self.log("等待停机确认" if report["stop_requested"] else "等待启动或重启结束后停机")
-            time.sleep(min(3, max(0, deadline - time.monotonic())))
+            raise ValueError("恢复原停机状态尚未确认")
+
+        try:
+            poll_readback(check, self.log, "恢复原停机状态", timeout=timeout, interval=max(1, timeout / 8))
+        except ValueError as error:
+            report["error"] = "恢复停机未确认；最后状态：" + str(report.get("states", {})) + f"；{error}"
+        return report
 
     def install_from_local(self, apk_path, db_ids, wait_time=300, verify=True, **options):
         apk = Path(apk_path).resolve()
@@ -144,7 +183,7 @@ class TikTokInstaller:
         return self._install("url", url, db_ids, wait_time, verify, **options)
 
     def _install(self, mode, source, db_ids, wait_time, verify, batch_size=1,
-                 start_stopped=False, restore_state=False, overlay=False):
+                 start_stopped=False, restore_state=False, overlay=False, request_wait=None, on_submitted=None):
         db_ids = device_ids(db_ids)
         if not 1 <= batch_size <= 12 or wait_time < 0:
             raise ValueError("批次大小必须为1至12，安装等待时间不能为负数")
@@ -162,7 +201,7 @@ class TikTokInstaller:
             for db_id in batch:
                 result["devices"][db_id] = {"status": "unconfirmed"}
             try:
-                instances = self.list_instances()
+                instances = poll_readback(self.list_instances, self.log, "安装前实例状态查询")
                 for db_id in batch:
                     device = result["devices"][db_id]
                     instance = instances.get(db_id)
@@ -185,10 +224,7 @@ class TikTokInstaller:
                         response = self.post_action("run", started)
                         record["start_response"] = response
                         if str(response.get("code")) != "200":
-                            for db_id in started:
-                                result["devices"][db_id].update(status="failed", error="VMOS拒绝启动", start_response=response)
-                            ready_candidates = [db_id for db_id in ready_candidates if db_id not in started]
-                            started = []
+                            self.log("启动响应未确认，只回查ROM实际状态；未重发启动请求")
                     except (requests.RequestException, ValueError) as error:
                         record["start_error"] = str(error)
                         self.log("启动请求结果不明确，回查ROM状态")
@@ -197,41 +233,87 @@ class TikTokInstaller:
                     result["devices"][db_id].update(status="unconfirmed", error="ROM就绪超时，未上传APK")
                 upload = []
                 for db_id in ready:
-                    apps = self.verifier.get_app_list(db_id)
-                    if apps is None:
+                    def read_apps():
+                        apps = self.verifier.get_app_list(db_id)
+                        if not isinstance(apps, list):
+                            raise ValueError("应用列表查询未确认")
+                        return apps
+                    try:
+                        if request_wait is not None:
+                            try:
+                                apps = read_apps()
+                            except (requests.RequestException, ValueError, TypeError):
+                                apps = []
+                                self.log("安装前应用列表不可用，继续发送本地APK安装请求")
+                        else:
+                            apps = poll_readback(read_apps, self.log, f"{db_id}安装前包名查询")
+                    except ValueError:
                         result["devices"][db_id].update(status="unconfirmed", error="无法查询安装前应用列表，未上传APK")
-                    elif self.package_name in apps:
+                        continue
+                    if self.package_name in apps:
                         result["devices"][db_id].update(status="already_installed", package_verified=True)
                         self.log(f"已安装，跳过上传: {db_id}")
                     else:
                         upload.append(db_id)
                 if upload:
                     self.log("等待主机安装队列；上传至安装确认逐批执行")
-                    with INSTALL_LOCK:
-                        self.log(f"上传安装包到 {len(upload)} 台，等待接口返回；不重发安装请求")
-                        response = self.uploader.upload_local(source, upload) if mode == "local" else self.uploader.install_from_url(source, upload)
-                        record["upload_response"] = response
-                        busy = (response.get("http_status") == 200 and str(response.get("code")) == "201"
-                                and response.get("msg") == "当前有安装任务进行中，请稍后再试")
-                        if busy:
-                            record["rejected_busy"] = True
-                            self.log("主机安装队列忙，本次请求被拒绝（业务码201）；只回查一次，未重发上传")
-                        else:
-                            self.log("安装请求已返回，回查实际包名")
-                        # 超时仍等待实际安装结果；明确忙拒绝未接受任务，只回查一次。
-                        verified = self.verifier.wait_for_install(upload, 0 if busy else wait_time, self.package_name, self.log) if verify else {"success": [], "unconfirmed": upload}
+                    while True:
+                        busy = False
+                        with installation_slot(request_wait, self.log, repeat_wait=request_wait is not None):
+                            self.log(f"上传安装包到 {len(upload)} 台，等待接口返回")
+                            upload_options = {"timeout": request_wait} if request_wait is not None else {}
+                            response = (self.uploader.upload_local(source, upload, **upload_options) if mode == "local"
+                                        else self.uploader.install_from_url(source, upload, **upload_options))
+                            record["upload_response"] = response
+                            if on_submitted is not None:
+                                on_submitted()
+                            busy = (response.get("http_status") == 200 and str(response.get("code")) == "201"
+                                    and response.get("msg") == "当前有安装任务进行中，请稍后再试")
+                            if busy and request_wait is not None:
+                                record["rejected_busy"] = True
+                                record["rejected_busy_count"] = record.get("rejected_busy_count", 0) + 1
+                                self.log(f"主机安装队列忙，业务码201明确拒绝请求；第{record['rejected_busy_count']}次，先回查包名")
+                            else:
+                                if busy:
+                                    record["rejected_busy"] = True
+                                    self.log("主机安装队列忙，本次请求被拒绝（业务码201）；只回查一次，未重发上传")
+                                else:
+                                    self.log("安装请求已返回，回查实际包名")
+                                package_wait = 0 if busy else wait_time
+                                verified = self.verifier.wait_for_install(upload, package_wait, self.package_name,
+                                                                          self.log) if verify else {
+                                                                              "success": [], "unconfirmed": upload}
+                                record["verification"] = verified
+                                for db_id in verified["success"]:
+                                    result["devices"][db_id].update(status="installed", package_verified=True)
+                                for db_id in verified["unconfirmed"]:
+                                    upload_error = response.get("error")
+                                    error = ("主机安装队列忙，本次请求被拒绝（业务码201），未重发上传" if busy else
+                                             f"上传响应未确认（{upload_error}）；安装尚未确认，未重发上传"
+                                             if upload_error else "安装尚未确认；请先使用--verify-only回查，未重发上传")
+                                    result["devices"][db_id].update(status="unconfirmed", error=error)
+                        if not busy or request_wait is None:
+                            break
+                        # 201明确表示未受理；先给目标最多一个120秒包名窗口，避免立即重复上传大APK。
+                        verified = self.verifier.wait_for_install(upload, 120, self.package_name, self.log) if verify else {
+                            "success": [], "unconfirmed": upload}
                         record["verification"] = verified
                         for db_id in verified["success"]:
                             result["devices"][db_id].update(status="installed", package_verified=True)
-                        for db_id in verified["unconfirmed"]:
-                            error = ("主机安装队列忙，本次请求被拒绝（业务码201），未重发上传" if busy else
-                                     "安装尚未确认；请先使用--verify-only回查，未重发上传")
-                            result["devices"][db_id].update(status="unconfirmed", error=error)
+                            self.log(f"忙拒绝后包名已出现，跳过重传: {db_id}")
+                        upload = verified["unconfirmed"]
+                        if not upload:
+                            break
+                        self.log("业务码201请求未受理且包名未出现；等待窗口结束，继续排队重试")
                 if overlay:
                     installed = [db_id for db_id in batch if result["devices"][db_id]["status"] in ("installed", "already_installed")]
                     record["permissions"] = self.permission_mgr.batch_grant_permissions(installed)
             except (requests.RequestException, OSError, ValueError, TypeError) as error:
                 record["error"] = str(error)
+                for db_id in batch:
+                    device = result["devices"].get(db_id, {})
+                    if device.get("status") == "unconfirmed" and not device.get("error"):
+                        device["error"] = str(error)
                 self.log(f"本批异常: {error}")
             finally:
                 if restore_state:

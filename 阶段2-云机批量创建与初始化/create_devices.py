@@ -8,6 +8,11 @@ from typing import List, Dict, Optional
 from device_config import ConfigLoader, OUTPUT_FILES, get_create_payload, POLL_CONFIG
 from port_allocator import PortAllocator
 from status_checker import StatusChecker, parse_instances
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "阶段1-环境准备与配置"))
+from check_vmos_connection import poll_readback, request_timeout
 
 
 def extract_db_id(result) -> Optional[str]:
@@ -56,7 +61,7 @@ class DeviceCreator:
         list_error = None
         try:
             response = requests.get(
-                f"{self.base_url}/container_api/v1/list_names", timeout=(5, 10)
+                f"{self.base_url}/container_api/v1/list_names", timeout=request_timeout(10)
             )
             response.raise_for_status()
             return parse_instances(response.json())
@@ -65,12 +70,12 @@ class DeviceCreator:
 
         try:
             response = requests.post(
-                f"{self.base_url}/container_api/v1/get_db", json={}, timeout=(5, 10)
+                f"{self.base_url}/container_api/v1/get_db", json={}, timeout=request_timeout(10)
             )
             response.raise_for_status()
             return parse_instances(response.json())
         except (requests.RequestException, ValueError) as error:
-            raise ValueError(f"list_names和get_db均查询失败: {list_error}; {error}") from error
+            raise ValueError(f"list_names和get_db均查询失败: {type(list_error).__name__}; {type(error).__name__}") from None
 
     def _submit_create(self, payload: Dict, result: Dict) -> Optional[str]:
         try:
@@ -100,27 +105,27 @@ class DeviceCreator:
     def _recover_created_id(self, user_name: str, previous_ids: set,
                             result: Dict) -> Optional[str]:
         """只回查新出现的同名实例，不重复发送创建请求。"""
-        for attempt in range(POLL_CONFIG["create_check_attempts"]):
-            try:
-                instances = self._list_instances()
-                matches = {
-                    item["db_id"] for item in instances
-                    if item.get("user_name") == user_name
-                    and item["db_id"] and item["db_id"] not in previous_ids
-                    and (item.get("state") or item.get("status")) not in (
-                        "creating", "failed", "error", "deleting"
-                    )
-                }
-                if len(matches) == 1:
-                    return matches.pop()
-                if len(matches) > 1:
-                    result["query_error"] = "发现多个新建同名实例，无法确定本次ID"
-                    return None
-            except (requests.RequestException, ValueError) as error:
-                result["query_error"] = str(error)
-            if attempt + 1 < POLL_CONFIG["create_check_attempts"]:
-                time.sleep(POLL_CONFIG["interval"])
-        return None
+        def check():
+            instances = self._list_instances()
+            matches = {
+                item["db_id"] for item in instances
+                if item.get("user_name") == user_name
+                and item["db_id"] and item["db_id"] not in previous_ids
+                and (item.get("state") or item.get("status")) not in (
+                    "creating", "failed", "error", "deleting"
+                )
+            }
+            if len(matches) == 1:
+                return matches.pop()
+            if len(matches) > 1:
+                raise ValueError("发现多个新建同名实例，无法确定本次ID")
+            raise ValueError("尚未发现唯一且可用的新建实例")
+
+        try:
+            return poll_readback(check, self.log, f"创建结果回查 {user_name}", timeout=60, interval=3)
+        except ValueError as error:
+            result["query_error"] = str(error)
+            return None
 
     def _record_created(self, result: Dict, db_id: str,
                         custom_ports: Optional[Dict]) -> Dict:
@@ -161,10 +166,18 @@ class DeviceCreator:
         self.creation_results.append(result)
         previous_ids = None
         try:
-            previous_ids = {item["db_id"] for item in self._list_instances()}
+            before = poll_readback(self._list_instances, self.log, f"创建前实例基线回查 {user_name}",
+                                   timeout=30, interval=2)
+            if any((item.get("user_name") or item.get("name")) == user_name for item in before):
+                result.update(status="unconfirmed", error="创建前已存在同名云机，未提交创建请求")
+                self.log(f"创建前发现同名云机 {user_name}，未发送创建请求")
+                return None
+            previous_ids = {item["db_id"] for item in before}
         except (requests.RequestException, ValueError) as error:
-            result["before_query_error"] = str(error)
-            self.log(f"创建前列表查询异常 {user_name}: {error}")
+            result["status"] = "unconfirmed"
+            result["before_query_error"] = str(error) if type(error) is ValueError else type(error).__name__
+            self.log(f"创建前实例身份基线未确认 {user_name}: {result['before_query_error']}；未发送创建请求")
+            return None
         db_id = self._submit_create(payload, result)
         result["creation_source"] = "接口返回" if db_id else "未确认"
         if result["status"] == "connection_failed":

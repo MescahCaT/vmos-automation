@@ -1,9 +1,12 @@
 """阶段1只读检查：VMOS、代理、APK、邮箱取码；不创建或启动云机。"""
 import argparse
+from contextlib import contextmanager
+from contextvars import ContextVar
 import ipaddress
 import json
 import re
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -12,6 +15,11 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "配置文件" / "config.json"
+READBACK_ATTEMPTS = 5
+STARTUP_TIMEOUT = 300
+STARTUP_ATTEMPTS = 20
+_READBACK_DEADLINE = ContextVar("vmos_readback_deadline", default=None)
+_READBACK_WINDOW = ContextVar("vmos_readback_window", default=None)
 API_PATHS = {
     "heartbeat": "/v1/heartbeat",
     "host_config": "/v1/get_hardware_cfg",
@@ -19,6 +27,67 @@ API_PATHS = {
     "templates": "/v1/get_adi_list",
     "instances": "/container_api/v1/list_names",
 }
+
+
+def request_timeout(seconds=30):
+    """回查中每次读取最多10秒，并共享当前验证轮次的总等待窗口。"""
+    deadline = _READBACK_DEADLINE.get()
+    if deadline is None:
+        return (5, seconds)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ValueError("只读验证等待窗口已结束")
+    return (min(3, remaining / 2), min(seconds, 10, remaining / 2))
+
+
+@contextmanager
+def time_only_waits(seconds=120):
+    """当前任务在最多两分钟内不限回查轮数，不改变其他线程及独立入口。"""
+    if type(seconds) is not int or not 1 <= seconds <= 120:
+        raise ValueError("单次等待窗口必须为1至120秒")
+    token = _READBACK_WINDOW.set(seconds)
+    try:
+        yield
+    finally:
+        _READBACK_WINDOW.reset(token)
+
+
+def poll_readback(check, log, label, timeout=60, interval=2, attempts=READBACK_ATTEMPTS, backoff=True):
+    """默认有限轮次；初始化任务在最多120秒的单次窗口内不限轮数。"""
+    window = _READBACK_WINDOW.get()
+    if window is not None:
+        timeout, interval, attempts, backoff = window if timeout > 0 else 0, 2, None, False
+    if attempts is not None and (type(attempts) is not int or attempts < 1):
+        raise ValueError("回查轮数必须为正整数")
+    if _READBACK_DEADLINE.get() is not None:
+        return check()
+    # timeout=0 表示只查一轮，仍须给这次读取一个短超时。
+    deadline = time.monotonic() + (timeout if timeout > 0 else 10)
+    token = _READBACK_DEADLINE.set(deadline)
+    try:
+        attempt = 0
+        while attempts is None or attempt < attempts:
+            attempt += 1
+            round_label = f"第{attempt}轮" if attempts is None else f"第{attempt}/{attempts}轮"
+            try:
+                result = check()
+                if attempt > 1:
+                    log(f"{label}：{round_label}确认通过")
+                return result
+            except (requests.RequestException, OSError, ValueError, TypeError,
+                    KeyError, IndexError, AttributeError) as error:
+                reason = str(error) if type(error) is ValueError else type(error).__name__
+                log(f"{label}：{round_label}未确认：{reason}")
+            remaining = deadline - time.monotonic()
+            if attempt == attempts or timeout <= 0 or remaining <= 0:
+                break
+            time.sleep(min(interval * 2 ** (attempt - 1), remaining / 2) if backoff else min(interval, remaining))
+            if time.monotonic() >= deadline:
+                break
+        queried = str(attempt) if attempts is None else f"{attempt}/{attempts}"
+        raise ValueError(f"{label}未确认（已查询{queried}轮，等待窗口{timeout}秒）：{reason}")
+    finally:
+        _READBACK_DEADLINE.reset(token)
 
 
 def read_json(path):
