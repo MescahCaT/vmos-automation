@@ -3,6 +3,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import os
@@ -329,7 +330,22 @@ def upload_device(host, curl, name, target, assets, destination, timeout, report
     return report
 
 
-def load_target_names(config_path):
+def resolve_config_paths(host, config_path):
+    if host is None:
+        config_path = config_path or ROOT / "阶段9-脚本开发与集成" / "batch10_create.example.json"
+        return config_path.resolve(), ROOT / "配置文件" / "config.json", ROOT / "日志"
+    try:
+        host = str(ipaddress.IPv4Address(host))
+    except ipaddress.AddressValueError:
+        raise ValueError("--host 必须是完整IPv4地址，不带协议或端口") from None
+    profile = ROOT / "主机配置" / host
+    if not profile.is_dir():
+        raise ValueError(f"主机配置尚未准备，请先执行：python -X utf8 .\\准备主机.py --host {host}")
+    return (config_path.resolve() if config_path else profile / "batch_create.json",
+            profile / "config.json", ROOT / "日志" / host)
+
+
+def load_target_names(config_path, main_config_path):
     config = read_json(config_path)
     if not isinstance(config, dict) or not isinstance(config.get("devices"), list) or not config["devices"]:
         raise ValueError("创建清单缺少非空 devices 数组")
@@ -338,7 +354,7 @@ def load_target_names(config_path):
         raise ValueError("创建清单中的云机名称无效")
     if len({name.casefold() for name in names}) != len(names):
         raise ValueError("创建清单存在重复云机名称")
-    main = read_json(ROOT / "配置文件" / "config.json")
+    main = read_json(main_config_path)
     if (main.get("vmos", {}).get("host_ip") != config.get("host_ip")
             or main.get("vmos", {}).get("port") != 18182):
         raise ValueError("创建清单与主配置中的 VMOS 地址或端口不一致")
@@ -349,8 +365,8 @@ def run(args):
     if args.workers < 1 or args.timeout < 10:
         raise ValueError("--workers 必须至少为1，--timeout 必须至少为10秒")
     destination = normalize_destination(args.destination)
-    config_path = args.config.resolve()
-    host_ip, manifest_names = load_target_names(config_path)
+    config_path, main_config_path, log_root = resolve_config_paths(args.host, args.config)
+    host_ip, manifest_names = load_target_names(config_path, main_config_path)
     if args.pool:
         if args.devices is None:
             raise ValueError("模式1必须指定 --devices 云机名称TXT")
@@ -368,7 +384,6 @@ def run(args):
         raise ValueError("找不到 curl.exe，未连接云机")
     targets = resolve_instances(f"http://{host_ip}:18182", names)
 
-    log_root = ROOT / "日志"
     log_root.mkdir(exist_ok=True)
     job = Path(tempfile.mkdtemp(prefix="upload-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-",
                                 dir=log_root))
@@ -438,8 +453,8 @@ def main(argv=None):
     modes.add_argument("--tasks", type=Path, help="模式2：Tab分隔的云机名与绝对路径任务清单")
     parser.add_argument("--devices", type=Path, help="模式1：一行一个云机名的TXT")
     parser.add_argument("--count", type=int, default=1, help="模式1：每台云机上传数量，默认1")
+    parser.add_argument("--host", help="完整主机IPv4地址，读取该主机的配置和清单")
     parser.add_argument("--config", type=Path,
-                        default=ROOT / "阶段9-脚本开发与集成" / "batch10_create.example.json",
                         help="云机名称清单JSON")
     parser.add_argument("--destination", default=DEFAULT_DESTINATION, help="云机内目标目录")
     parser.add_argument("--workers", type=int, default=1, help="同时处理的云机数，默认1")

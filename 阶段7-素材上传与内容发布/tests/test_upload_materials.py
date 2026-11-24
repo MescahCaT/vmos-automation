@@ -7,10 +7,31 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from upload_materials import archive_file, parse_task_list, plan_pool_uploads, upload_file
+import upload_materials
+from upload_materials import archive_file, load_target_names, parse_task_list, plan_pool_uploads, resolve_config_paths, upload_file
 
 
 class UploadMaterialsTests(unittest.TestCase):
+    def test_host_selects_its_manifest_config_and_log_paths(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(upload_materials, "ROOT", Path(temp)):
+            root = Path(temp)
+            host = "192.168.110.35"
+            profile = root / "主机配置" / host
+            profile.mkdir(parents=True)
+            (profile / "config.json").write_text(json.dumps({
+                "vmos": {"host_ip": host, "port": 18182}
+            }), encoding="utf-8")
+            (profile / "batch_create.json").write_text(json.dumps({
+                "host_ip": host, "devices": [{"user_name": "proxy53.1"}]
+            }), encoding="utf-8")
+
+            config_path, main_path, log_path = resolve_config_paths(host, None)
+
+            self.assertEqual(config_path, profile / "batch_create.json")
+            self.assertEqual(main_path, profile / "config.json")
+            self.assertEqual(log_path, root / "日志" / host)
+            self.assertEqual(load_target_names(config_path, main_path), (host, {"proxy53.1"}))
+
     def test_pool_assigns_distinct_first_level_supported_files(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
