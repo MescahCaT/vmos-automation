@@ -4,13 +4,18 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import ipaddress
 import json
+import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 import requests
+
+
+_JSON_WRITE_LOCK = threading.RLock()
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,10 +100,18 @@ def read_json(path):
 
 
 def save_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temp.replace(path)
+    with _JSON_WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        for attempt in range(4):
+            try:
+                temp.replace(path)
+                return
+            except PermissionError as error:
+                if os.name != "nt" or getattr(error, "winerror", None) not in (5, 32) or attempt == 3:
+                    raise
+                time.sleep(0.025 * (attempt + 1))
 
 
 def list_data(data):

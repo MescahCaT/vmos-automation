@@ -38,11 +38,76 @@ def host_directory(host):
     return ROOT / "主机配置" / address
 
 
-def load_resources(config, names, bindings_path, operation="initialize", main_path=None, proxy_path=None):
+def device_name(instance):
+    return instance.get("user_name") or instance.get("name") if isinstance(instance, dict) else None
+
+
+def proxy_group_from_name(name):
+    prefix = re.split(r"[.-]", name, maxsplit=1)[0]
+    group = re.sub(r"[^0-9]", "", prefix)
+    if not group:
+        raise ValueError(f"云机名称无法推导代理组：{name}")
+    return group
+
+
+def select_live_devices(instances, requested_names=None):
+    by_name = {}
+    for instance in instances:
+        name = device_name(instance)
+        if isinstance(name, str) and name:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{3,}", name):
+                raise ValueError(f"主机实时列表中的云机名称格式无效：{name}")
+            key = name.casefold()
+            if key in by_name:
+                raise ValueError(f"主机实时列表存在重复云机名称：{name}")
+            by_name[key] = (name, instance)
+    if requested_names is None:
+        if not by_name:
+            raise ValueError("主机实时列表中没有可操作的云机")
+        return [(name, instance) for name, instance in by_name.values()]
+    if len({name.casefold() for name in requested_names}) != len(requested_names):
+        raise ValueError("指定的云机名称重复")
+    missing = [name for name in requested_names if name.casefold() not in by_name]
+    if missing:
+        raise ValueError("指定云机不在主机实时列表中：" + "、".join(missing))
+    wrong_case = [name for name in requested_names if by_name[name.casefold()][0] != name]
+    if wrong_case:
+        raise ValueError("云机名称大小写与主机实时列表不一致：" + "、".join(wrong_case))
+    return [by_name[name.casefold()] for name in requested_names]
+
+
+def save_live_inventory(host_ip, instances):
+    devices = []
+    for instance in instances:
+        name = device_name(instance)
+        if isinstance(name, str) and name:
+            devices.append({"user_name": name, "db_id": instance["db_id"],
+                            "state": instance.get("state") or instance.get("status")})
+    path = ROOT / "数据" / host_ip / "device_inventory.json"
+    save_json(path, {"host_ip": host_ip, "updated_at": datetime.now().astimezone().isoformat(),
+                     "devices": devices})
+    return path
+
+
+def runtime_bindings(names, bindings_path=None):
+    configured = read_json(bindings_path) if bindings_path is not None else {}
+    if not isinstance(configured, dict):
+        raise ValueError("代理绑定文件格式无效")
+    bindings = {}
+    for name in names:
+        group = proxy_group_from_name(name)
+        if name in configured and configured[name] != group:
+            raise ValueError(f"云机 {name} 的代理绑定为 {configured[name]}，按名称规则应为 {group}")
+        bindings[name] = group
+    return bindings
+
+
+def load_resources(config, names, bindings_path, operation="initialize", main_path=None, proxy_path=None,
+                   bindings_override=None):
     main = read_json(main_path or ROOT / "配置文件" / "config.json")
     if main["vmos"]["host_ip"] != config["host_ip"] or main["vmos"]["port"] != 18182:
         raise ValueError("创建清单与主配置中的 VMOS 地址或端口不一致")
-    bindings = read_json(bindings_path)
+    bindings = bindings_override if bindings_override is not None else read_json(bindings_path)
     proxy_path = proxy_path or ROOT / main["proxy"]["config_file"]
     document = read_json(proxy_path)
     before = copy.deepcopy(document)
@@ -491,41 +556,81 @@ def create(config_path, configure_only=False, name=None, bindings_path=None, wor
     profile = host_directory(host) if host is not None else None
     if profile is not None and not (profile / "config.json").is_file():
         raise ValueError(f"主机配置尚未准备，请先执行：python -X utf8 .\\准备主机.py --host {host}")
+    config_path_supplied = config_path is not None
     config_path = config_path or (profile / "batch_create.json" if profile else
                                   ROOT / "阶段9-脚本开发与集成" / "batch10_create.example.json")
     main_path = profile / "config.json" if profile else ROOT / "配置文件" / "config.json"
-    print(f"读取创建配置：{config_path}", flush=True)
-    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    devices = config.get("devices") if isinstance(config, dict) else None
-    if not isinstance(devices, list) or not devices:
-        raise ValueError("创建清单必须包含非空 devices 数组，请先生成清单")
-    names = [device.get("user_name") if isinstance(device, dict) else None for device in devices]
-    if any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{3,}", name) for name in names):
-        raise ValueError("云机名称必须至少3位，只含字母、数字、点、下划线或横线")
-    if len({name.casefold() for name in names}) != len(names):
-        raise ValueError("创建清单有重复名称，请先修改")
-    if not config.get("host_ip") or not isinstance(config.get("default_config"), dict) or not config["default_config"]:
-        raise ValueError("创建清单缺少主机地址或公共参数")
-    if host is not None and config["host_ip"] != host:
-        raise ValueError("--host 与所选清单的 host_ip 不一致，未操作云机")
-    requested_names = [name] if name is not None else selected_names
-    # 指定名称必须全部存在，不能悄悄忽略。
-    if requested_names is not None:
-        if len({item.casefold() for item in requested_names}) != len(requested_names):
+    if config_path_supplied and not config_path.is_file():
+        raise FileNotFoundError(f"指定清单不存在：{config_path}")
+    runtime_mode = operation != "initialize" or configure_only
+    print(f"读取{'主机操作配置' if runtime_mode else '创建清单'}：{main_path if runtime_mode else config_path}", flush=True)
+    config = (json.loads(config_path.read_text(encoding="utf-8-sig"))
+              if config_path.is_file() and (not runtime_mode or config_path_supplied) else {})
+    if not config and not runtime_mode:
+        raise ValueError("创建清单不存在，请先生成清单")
+    main = read_json(main_path)
+    if runtime_mode:
+        if not isinstance(config, dict):
+            config = {}
+        config["host_ip"] = config.get("host_ip") or main.get("vmos", {}).get("host_ip")
+        if not config.get("host_ip") or main.get("vmos", {}).get("port") != 18182:
+            raise ValueError("主配置缺少有效 VMOS 地址或端口")
+        if config["host_ip"] != main.get("vmos", {}).get("host_ip"):
+            raise ValueError("所选清单与主机配置中的 VMOS 地址不一致，未操作云机")
+        if host is not None and config["host_ip"] != host:
+            raise ValueError("--host 与主机配置中的 host_ip 不一致，未操作云机")
+        requested_names = [name] if name is not None else selected_names
+        if requested_names is not None and len({item.casefold() for item in requested_names}) != len(requested_names):
             raise ValueError("指定的云机名称重复")
-        missing = [item for item in requested_names if item not in names]
-        if missing:
-            raise ValueError("指定名称不在本批清单中：" + "、".join(missing))
-        config["devices"] = [device for device in devices if device["user_name"] in requested_names]
-    names = [device["user_name"] for device in config["devices"]]
-    config["count"] = len(names)
+        if config_path.is_file():
+            inventory_reader = DeviceCreator(str(config_path))
+            inventory_reader.base_url = f"http://{config['host_ip']}:18182"
+            list_instances = inventory_reader._list_instances
+        else:
+            inventory_reader = TikTokInstaller(f"http://{config['host_ip']}:18182")
+            list_instances = lambda: list(inventory_reader.list_instances().values())
+        instances = poll_readback(list_instances, print, "主机实时云机列表回查", timeout=30, interval=2)
+        inventory_path = save_live_inventory(config["host_ip"], instances)
+        print(f"主机实时云机清单：{inventory_path}", flush=True)
+        selected = select_live_devices(instances, requested_names)
+        names = [name for name, _ in selected]
+        config["devices"] = [{"user_name": name, "remark": name} for name in names]
+        config["count"] = len(names)
+    else:
+        devices = config.get("devices") if isinstance(config, dict) else None
+        if not isinstance(devices, list) or not devices:
+            raise ValueError("创建清单必须包含非空 devices 数组，请先生成清单")
+        names = [device.get("user_name") if isinstance(device, dict) else None for device in devices]
+        if any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{3,}", name) for name in names):
+            raise ValueError("云机名称必须至少3位，只含字母、数字、点、下划线或横线")
+        if len({name.casefold() for name in names}) != len(names):
+            raise ValueError("创建清单有重复名称，请先修改")
+        if not config.get("host_ip") or not isinstance(config.get("default_config"), dict) or not config["default_config"]:
+            raise ValueError("创建清单缺少主机地址或公共参数")
+        if host is not None and config["host_ip"] != host:
+            raise ValueError("--host 与所选清单的 host_ip 不一致，未操作云机")
+        requested_names = [name] if name is not None else selected_names
+        if requested_names is not None:
+            if len({item.casefold() for item in requested_names}) != len(requested_names):
+                raise ValueError("指定的云机名称重复")
+            missing = [item for item in requested_names if item not in names]
+            if missing:
+                raise ValueError("指定名称不在本批清单中：" + "、".join(missing))
+            config["devices"] = [device for device in devices if device["user_name"] in requested_names]
+        names = [device["user_name"] for device in config["devices"]]
+        config["count"] = len(names)
+    bindings_path_supplied = bindings_path is not None
     bindings_path = bindings_path or (profile / "bindings.json" if profile else
                                       ROOT / "阶段9-脚本开发与集成" / "batch10_bindings.example.json")
-    if not create_only and operation != "install":
+    if runtime_mode and operation != "install":
+        bindings = runtime_bindings(names, bindings_path if bindings_path_supplied else None)
+        main, bindings, proxies = load_resources(config, names, bindings_path, operation, main_path,
+                                                 profile / "proxy_list.json" if profile else None,
+                                                 bindings_override=bindings)
+    elif not create_only and operation != "install":
         main, bindings, proxies = load_resources(config, names, bindings_path, operation, main_path,
                                                  profile / "proxy_list.json" if profile else None)
     else:
-        main = read_json(main_path)
         if main["vmos"]["host_ip"] != config["host_ip"] or main["vmos"]["port"] != 18182:
             raise ValueError("创建清单与主配置中的 VMOS 地址或端口不一致")
         bindings, proxies = {}, {}
@@ -546,8 +651,9 @@ def create(config_path, configure_only=False, name=None, bindings_path=None, wor
         save_json(job / "apk_input.json", apk)
     print(f"本批清单：{len(names)} 台，主机：{config['host_ip']}", flush=True)
     print(f"结果目录：{job}", flush=True)
-    creator = DeviceCreator(str(snapshot))
-    instances = poll_readback(creator._list_instances, print, "创建前实例基线回查", timeout=30, interval=2)
+    if not runtime_mode:
+        creator = DeviceCreator(str(snapshot))
+        instances = poll_readback(creator._list_instances, print, "创建前实例基线回查", timeout=30, interval=2)
     if configure_only:
         selected = []
         identity_failures = []

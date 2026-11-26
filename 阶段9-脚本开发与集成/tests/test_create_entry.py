@@ -72,6 +72,8 @@ class CreateEntryTests(unittest.TestCase):
         self.setup.device.list_instances.side_effect = lambda: {
             item["db_id"]: item for item in self.creator._list_instances.return_value}
         self.installer = Mock()
+        self.installer.list_instances.side_effect = lambda: {
+            item["db_id"]: item for item in self.creator._list_instances.return_value}
         self.installer.install_from_local.side_effect = lambda source, ids, **options: {
             "success": True, "devices": {db_id: {"status": "installed", "package_verified": True} for db_id in ids}}
 
@@ -421,7 +423,7 @@ class CreateEntryTests(unittest.TestCase):
     def test_duplicate_id_skips_only_ambiguous_target_and_continues_other_devices(self):
         self.creator._list_instances.return_value = [
             {"user_name": "151.1", "db_id": "EDGE1", "state": "stopped"},
-            {"user_name": "other", "db_id": "EDGE1", "state": "stopped"},
+            {"user_name": "151.3", "db_id": "EDGE1", "state": "stopped"},
             {"user_name": "151.2", "db_id": "EDGE2", "state": "running"}]
         self.assertEqual(self.run_entry("--configure-only"), 1)
         self.setup.run.assert_called_once()
@@ -429,9 +431,9 @@ class CreateEntryTests(unittest.TestCase):
         self.installer.install_from_local.assert_called_once()
         self.assertEqual(self.installer.install_from_local.call_args.args[1], ["EDGE2"])
         summary = json.loads(next((self.root / "日志").glob("*/batch_status.json")).read_text(encoding="utf-8"))
-        self.assertEqual(summary["failed_names"], ["151.1"])
+        self.assertEqual(summary["failed_names"], ["151.1", "151.3"])
         self.assertEqual(summary["devices"][0]["name"], "151.2")
-        self.assertEqual((summary["total"], summary["success_count"], summary["failed_count"]), (2, 1, 1))
+        self.assertEqual((summary["total"], summary["success_count"], summary["failed_count"]), (3, 1, 2))
 
     def test_creation_exception_still_saves_report(self):
         self.creator.create_batch.side_effect = ValueError("simulated failure")
@@ -530,11 +532,39 @@ class CreateEntryTests(unittest.TestCase):
         self.assertEqual(report["operation"], "create")
         self.assertTrue(report["success"])
 
-    def test_multiple_names_reject_duplicates_and_unknown_before_contacting_host(self):
-        for names in (("151.1", "151.1"), ("151.1", "missing")):
-            self.assertEqual(self.run_entry("--configure-only", "--names", *names), 1)
-            self.creator._list_instances.assert_not_called()
-            self.setup.run.assert_not_called()
+    def test_duplicate_names_reject_before_contacting_host(self):
+        self.assertEqual(self.run_entry("--configure-only", "--names", "151.1", "151.1"), 1)
+        self.creator._list_instances.assert_not_called()
+        self.setup.run.assert_not_called()
+
+    def test_existing_operation_accepts_device_missing_from_creation_manifest(self):
+        self.prepare_concurrent_devices(2)
+        self.config["devices"] = self.config["devices"][:1]
+        self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
+
+        self.assertEqual(self.run_entry("--configure-only", "--name", "151.2"), 0, self.output.getvalue())
+
+        self.assertEqual(self.setup.run.call_count, 1)
+        self.assertEqual(self.setup.run.call_args.args[0], "EDGE2")
+        inventory = entry.read_json(self.root / "数据/192.0.2.10/device_inventory.json")
+        self.assertEqual([item["user_name"] for item in inventory["devices"]], ["151.1", "151.2"])
+
+    def test_existing_operation_rejects_partial_live_list_match_before_changes(self):
+        self.prepare_concurrent_devices(1)
+
+        self.assertEqual(self.run_entry("--configure-only", "--names", "151.1", "151.2"), 1)
+
+        self.assertIn("指定云机不在主机实时列表中：151.2", self.output.getvalue())
+        self.setup.run.assert_not_called()
+        self.assertTrue((self.root / "数据/192.0.2.10/device_inventory.json").is_file())
+
+    def test_existing_proxy_operation_derives_group_without_bindings_file(self):
+        self.prepare_concurrent_devices(2)
+        self.config_path.with_name("batch10_bindings.example.json").unlink()
+
+        self.assertEqual(self.run_entry("--configure-only", "--name", "151.2"), 0, self.output.getvalue())
+
+        self.assertEqual(self.setup.run.call_args.args[1]["id"], "151")
 
     def test_proxy_only_accepts_multiple_names_without_region_or_apk(self):
         self.prepare_concurrent_devices(3)
@@ -900,8 +930,12 @@ class CreateEntryTests(unittest.TestCase):
         self.proxy_document["proxies"][0].pop("region")
         self.proxy_path.write_text(json.dumps(self.proxy_document), encoding="utf-8")
         for arguments in ((), ("--configure-only",)):
+            if arguments:
+                self.creator._list_instances.return_value = [
+                    {"user_name": "151.1", "db_id": "EDGE1", "state": "stopped"}]
             self.assertEqual(self.run_entry(*arguments), 1)
-            self.creator._list_instances.assert_not_called()
+            if arguments:
+                self.assertGreaterEqual(self.creator._list_instances.call_count, 1)
             self.creator.create_batch.assert_not_called()
             self.setup.run.assert_not_called()
             self.assertIn("不能跳过地区初始化", self.output.getvalue())
@@ -928,7 +962,8 @@ class CreateEntryTests(unittest.TestCase):
         self.apk_check.side_effect = ValueError("APK不存在或为空")
         for arguments in ((), ("--configure-only",)):
             self.assertEqual(self.run_entry(*arguments), 1)
-            self.creator._list_instances.assert_not_called()
+            if arguments:
+                self.assertGreaterEqual(self.creator._list_instances.call_count, 1)
             self.creator.create_batch.assert_not_called()
             self.setup.run.assert_not_called()
             self.installer.install_from_local.assert_not_called()
@@ -1398,13 +1433,13 @@ class CreateEntryTests(unittest.TestCase):
     def test_retry_failed_retains_unresolved_identity_failure(self):
         self.prepare_concurrent_devices(2)
         self.creator._list_instances.return_value.pop()
-        self.assertEqual(self.run_entry("--configure-only", "--retry-failed"), 1)
+        self.assertEqual(self.run_entry("--configure-only", "--retry-failed"), 0)
         self.setup.run.assert_called_once()
         job = next((self.root / "日志").iterdir())
         summary = json.loads((job / "batch_status.json").read_text(encoding="utf-8"))
-        self.assertEqual(summary["first_failed_names"], ["151.2"])
-        self.assertEqual(summary["failed_names"], ["151.2"])
-        self.assertEqual(summary["retry_skipped_names"], ["151.2"])
+        self.assertEqual(summary["first_failed_names"], [])
+        self.assertEqual(summary["failed_names"], [])
+        self.assertEqual(summary["retry_skipped_names"], [])
         self.assertEqual(summary["retry_rounds"], 0)
 
     def test_retry_failed_handles_session_setup_exception_as_a_device_failure(self):

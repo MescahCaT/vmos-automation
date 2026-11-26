@@ -29,6 +29,12 @@ DEFAULT_DESTINATION = "/sdcard/DCIM/Codex/"
 DEVICE_NAME = re.compile(r"[A-Za-z0-9_.-]{3,}")
 
 
+def live_name_candidates(name, live_names):
+    prefix = re.split(r"[.-]", name, maxsplit=1)[0].casefold()
+    return sorted(item for item in live_names
+                  if re.split(r"[.-]", item, maxsplit=1)[0].casefold() == prefix)
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -58,7 +64,7 @@ def checked_asset(path, asset_id, device, task_line=None, hashes=None):
             "mime_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream"}
 
 
-def parse_device_list(path, manifest_names):
+def parse_device_list(path, live_names):
     names, seen = [], set()
     for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         name = line.strip()
@@ -68,8 +74,10 @@ def parse_device_list(path, manifest_names):
             raise ValueError(f"云机列表第 {line_number} 行名称格式无效：{name}")
         if name.casefold() in seen:
             raise ValueError(f"云机列表有重复名称：{name}")
-        if name not in manifest_names:
-            raise ValueError(f"云机名称不在当前创建清单中：{name}")
+        if name not in live_names:
+            candidates = live_name_candidates(name, live_names)
+            detail = f"；同组实时名称：{'、'.join(candidates)}" if candidates else ""
+            raise ValueError(f"云机名称不在当前主机实时云机列表中：{name}{detail}")
         names.append(name)
         seen.add(name.casefold())
     if not names:
@@ -111,7 +119,7 @@ def task_files(path):
     raise ValueError(f"任务路径不是文件或文件夹：{path}")
 
 
-def parse_task_list(path, manifest_names):
+def parse_task_list(path, live_names):
     assets, skipped, seen_pairs, hashes = [], [], set(), {}
     for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
@@ -120,8 +128,8 @@ def parse_task_list(path, manifest_names):
         if len(fields) != 2:
             raise ValueError(f"任务清单第 {line_number} 行须为两列 Tab 分隔：云机名<TAB>绝对路径")
         name, source = fields[0].strip(), fields[1].strip()
-        if name not in manifest_names:
-            raise ValueError(f"任务清单第 {line_number} 行云机不在当前创建清单中：{name}")
+        if name not in live_names:
+            raise ValueError(f"任务清单第 {line_number} 行云机不在当前主机实时云机列表中：{name}")
         source_path = Path(source).expanduser()
         if not source_path.is_absolute():
             raise ValueError(f"任务清单第 {line_number} 行素材路径必须是绝对路径")
@@ -332,8 +340,11 @@ def upload_device(host, curl, name, target, assets, destination, timeout, report
 
 def resolve_config_paths(host, config_path):
     if host is None:
-        config_path = config_path or ROOT / "阶段9-脚本开发与集成" / "batch10_create.example.json"
-        return config_path.resolve(), ROOT / "配置文件" / "config.json", ROOT / "日志"
+        main_config_path = ROOT / "配置文件" / "config.json"
+        host_ip = read_json(main_config_path).get("vmos", {}).get("host_ip")
+        if not isinstance(host_ip, str) or not host_ip:
+            raise ValueError("主配置缺少 VMOS 主机地址")
+        return config_path.resolve() if config_path else None, main_config_path, ROOT / "日志" / host_ip, host_ip
     try:
         host = str(ipaddress.IPv4Address(host))
     except ipaddress.AddressValueError:
@@ -341,41 +352,51 @@ def resolve_config_paths(host, config_path):
     profile = ROOT / "主机配置" / host
     if not profile.is_dir():
         raise ValueError(f"主机配置尚未准备，请先执行：python -X utf8 .\\准备主机.py --host {host}")
-    return (config_path.resolve() if config_path else profile / "batch_create.json",
-            profile / "config.json", ROOT / "日志" / host)
+    return config_path.resolve() if config_path else None, profile / "config.json", ROOT / "日志" / host, host
 
 
-def load_target_names(config_path, main_config_path):
-    config = read_json(config_path)
-    if not isinstance(config, dict) or not isinstance(config.get("devices"), list) or not config["devices"]:
-        raise ValueError("创建清单缺少非空 devices 数组")
-    names = [item.get("user_name") if isinstance(item, dict) else None for item in config["devices"]]
-    if any(not isinstance(name, str) or not DEVICE_NAME.fullmatch(name) for name in names):
-        raise ValueError("创建清单中的云机名称无效")
-    if len({name.casefold() for name in names}) != len(names):
-        raise ValueError("创建清单存在重复云机名称")
+def load_live_names(config_path, main_config_path, host_ip):
+    if config_path is not None and not config_path.is_file():
+        raise FileNotFoundError(f"指定清单不存在：{config_path}")
+    config = read_json(config_path) if config_path is not None else {}
     main = read_json(main_config_path)
-    if (main.get("vmos", {}).get("host_ip") != config.get("host_ip")
-            or main.get("vmos", {}).get("port") != 18182):
-        raise ValueError("创建清单与主配置中的 VMOS 地址或端口不一致")
-    return config["host_ip"], set(names)
+    if main.get("vmos", {}).get("port") != 18182 or main.get("vmos", {}).get("host_ip") != host_ip:
+        raise ValueError("主配置中的 VMOS 地址或端口无效")
+    if config.get("host_ip") and config["host_ip"] != host_ip:
+        raise ValueError("指定清单与主机配置中的 VMOS 地址不一致")
+    instances = ProxySetup(f"http://{host_ip}:18182").device.list_instances()
+    names = []
+    devices = []
+    for instance in instances.values():
+        name = instance.get("user_name") or instance.get("name")
+        if not isinstance(name, str) or not DEVICE_NAME.fullmatch(name):
+            raise ValueError("主机实时列表中的云机名称无效")
+        names.append(name)
+        devices.append({"user_name": name, "db_id": instance["db_id"],
+                        "state": instance.get("state") or instance.get("status")})
+    if len({name.casefold() for name in names}) != len(names):
+        raise ValueError("主机实时列表存在重复云机名称")
+    inventory_path = ROOT / "数据" / host_ip / "device_inventory.json"
+    save_json(inventory_path, {"host_ip": host_ip, "updated_at": datetime.now().astimezone().isoformat(),
+                               "devices": devices})
+    return host_ip, set(names)
 
 
 def run(args):
     if args.workers < 1 or args.timeout < 10:
         raise ValueError("--workers 必须至少为1，--timeout 必须至少为10秒")
     destination = normalize_destination(args.destination)
-    config_path, main_config_path, log_root = resolve_config_paths(args.host, args.config)
-    host_ip, manifest_names = load_target_names(config_path, main_config_path)
+    config_path, main_config_path, log_root, host_ip = resolve_config_paths(args.host, args.config)
+    host_ip, live_names = load_live_names(config_path, main_config_path, host_ip)
     if args.pool:
         if args.devices is None:
             raise ValueError("模式1必须指定 --devices 云机名称TXT")
-        names = parse_device_list(args.devices.resolve(strict=True), manifest_names)
+        names = parse_device_list(args.devices.resolve(strict=True), live_names)
         assets, skipped_count = plan_pool_uploads(args.pool, names, args.count)
         mode = "pool"
         skipped = [{"unsupported_or_subfolder_entries": skipped_count}]
     else:
-        assets, skipped = parse_task_list(args.tasks.resolve(strict=True), manifest_names)
+        assets, skipped = parse_task_list(args.tasks.resolve(strict=True), live_names)
         names = list(dict.fromkeys(asset["device"] for asset in assets))
         mode = "tasks"
     validate_remote_names(assets)

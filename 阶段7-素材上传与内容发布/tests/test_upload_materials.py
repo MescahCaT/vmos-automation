@@ -8,10 +8,32 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import upload_materials
-from upload_materials import archive_file, load_target_names, parse_task_list, plan_pool_uploads, resolve_config_paths, upload_file
+from upload_materials import (archive_file, load_live_names, parse_device_list, parse_task_list,
+                               plan_pool_uploads, resolve_config_paths, resolve_instances, upload_file)
 
 
 class UploadMaterialsTests(unittest.TestCase):
+    def test_device_name_resolves_to_live_instance_id(self):
+        with patch.object(upload_materials, "ProxySetup") as setup:
+            setup.return_value.device.list_instances.return_value = {
+                "EDGE10402": {"db_id": "EDGE10402", "user_name": "s104-02",
+                               "state": "stopped", "http_api_port": 18042}}
+            self.assertEqual(resolve_instances("http://192.0.2.10:18182", ["s104-02"]),
+                             {"s104-02": {"db_id": "EDGE10402", "state": "stopped"}})
+
+    def test_missing_live_device_reports_live_list(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "devices.txt"
+            path.write_text("s104-02\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "实时云机列表.*s104-01"):
+                parse_device_list(path, {"s104-01"})
+
+    def test_missing_explicit_manifest_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            missing = Path(temp) / "missing.json"
+            with self.assertRaises(FileNotFoundError):
+                load_live_names(missing, missing, "192.0.2.10")
+
     def test_host_selects_its_manifest_config_and_log_paths(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(upload_materials, "ROOT", Path(temp)):
             root = Path(temp)
@@ -22,15 +44,21 @@ class UploadMaterialsTests(unittest.TestCase):
                 "vmos": {"host_ip": host, "port": 18182}
             }), encoding="utf-8")
             (profile / "batch_create.json").write_text(json.dumps({
-                "host_ip": host, "devices": [{"user_name": "proxy53.1"}]
+                "host_ip": host, "devices": [{"user_name": "other-01"}]
             }), encoding="utf-8")
 
-            config_path, main_path, log_path = resolve_config_paths(host, None)
+            config_path, main_path, log_path, resolved_host = resolve_config_paths(host, None)
 
-            self.assertEqual(config_path, profile / "batch_create.json")
+            self.assertIsNone(config_path)
             self.assertEqual(main_path, profile / "config.json")
             self.assertEqual(log_path, root / "日志" / host)
-            self.assertEqual(load_target_names(config_path, main_path), (host, {"proxy53.1"}))
+            self.assertEqual(resolved_host, host)
+            with patch.object(upload_materials, "ProxySetup") as setup:
+                setup.return_value.device.list_instances.return_value = {
+                    "EDGE1": {"db_id": "EDGE1", "user_name": "proxy53.1", "state": "stopped"}}
+                self.assertEqual(load_live_names(config_path, main_path, host), (host, {"proxy53.1"}))
+            inventory = json.loads((root / "数据" / host / "device_inventory.json").read_text(encoding="utf-8"))
+            self.assertEqual(inventory["devices"][0]["db_id"], "EDGE1")
 
     def test_pool_assigns_distinct_first_level_supported_files(self):
         with tempfile.TemporaryDirectory() as temp:
